@@ -1,9 +1,7 @@
 # AMI 2.0 on Snowflake — Detailed Design Document
 
-**Version:** 0.1 (draft for review)
-**Date:** 2026-04-24
 **Author:** Solution Engineering
-**Status:** Pre-build discussion
+**Status:** Reference architecture
 
 ---
 
@@ -17,9 +15,7 @@ This document is the detailed design for a Snowflake-native Advanced Metering In
 4. **AMI 2.0 Observability & SLA Dashboard**
 5. **(Extension) Real-time Anomaly Detection on AMI Intervals**
 
-The build will be **data-engineering-first and infrastructure-heavy**. We will synthesize a realistic 100K-meter / 1-year dataset (~3.5B interval rows) directly inside Snowflake and demonstrate the full production-style pattern: Snowpipe Streaming, VARIANT landing, Dynamic Table chains with MERGE semantics, Data Metric Functions with anomaly detection, row-access policies, secure views, and Cortex ML for anomaly scoring.
-
-Out of scope (intentionally): a heavyweight front-end. Any UI is a thin Snowsight dashboard or Streamlit monitoring view — this demo's value is in the pipeline itself.
+The platform is **data-engineering-first and infrastructure-heavy**. A realistic 100K-meter / 1-year dataset (~3.5B interval rows) is synthesized directly inside Snowflake and runs through a full production-style pattern: Snowpipe Streaming, VARIANT landing, Dynamic Table chains with MERGE semantics, Data Metric Functions with anomaly detection, row-access policies, secure views, and Cortex ML for anomaly scoring. A React single-page application served from Snowpark Container Services provides the operator-facing dashboard.
 
 ---
 
@@ -223,7 +219,7 @@ At 100K meters × 365 days × 96 intervals/day, we produce **3.504 billion** int
 3. **Inject controlled artifacts**: missing intervals, estimated intervals, outages, meter swaps, known anomalies — so observability and anomaly detection have signal.
 4. **Two-speed ingestion**: bulk-generate the historical year directly into `INTERVAL_READ_15MIN_RAW` in one shot; then run a live Python Snowpipe Streaming producer for the *last hour* so we can watch the pipeline work in real time during the demo.
 
-### 4.2 Meter & dimension generation (Phase 1)
+### 4.2 Meter & dimension generation
 - 100,000 meters distributed across:
   - 4 utility territories (NE, SE, MW, W) with distinct timezones
   - 50 substations, 2,000 feeders, 20,000 transformers (5 meters / xfmr avg)
@@ -231,7 +227,7 @@ At 100K meters × 365 days × 96 intervals/day, we produce **3.504 billion** int
   - Rate plan mix: 40% flat, 50% TOU-3-tier, 10% TOU-critical-peak
   - 3% of meters have DER (solar) → non-zero `KWH_RECEIVED`
 
-### 4.3 Interval read generation (Phase 1 continued)
+### 4.3 Interval read generation
 Load-shape formula per meter:
 
 ```
@@ -252,22 +248,21 @@ kwh(t) = base_load(segment)
 - **Estimated intervals**: fill gaps with `VEE_STATUS='ESTIMATED'` and `ESTIMATION_METHOD='LOAD_PROFILE'` for a random ~60% of gaps.
 - **Outages**: 0.1% of meter-days → paired `METER_EVENT` rows (OUTAGE/RESTORE) plus zero reads for duration.
 - **Late arrivals**: ~2% of reads arrive 15–240 minutes late (demonstrates MERGE + SLA dashboard).
-- **Known anomaly injection** (for Phase 6 validation):
+- **Known anomaly injection** (ground-truth labels for anomaly-detection validation):
   - ~50 meters: sustained 3× consumption spike for a 4-hour window (energy theft pattern)
   - ~30 meters: dead for 48 hours (stuck dial)
   - ~20 meters: voltage sag to <200 V for 1 hour
 
-### 4.5 Bulk generation plan (executable on AMI_LOAD_WH @ LARGE)
-Approximate wall-clock:
+### 4.5 Bulk generation (executed on `AMI_LOAD_WH` @ LARGE)
+
 1. Dimensions (all tables < 1M rows): ~1 min
-2. 3.5B interval rows in one multi-statement `INSERT ... SELECT FROM GENERATOR`: ~20–40 min on L
-3. Inject gaps / events: ~5 min
-4. VARIANT wrap + load to `INTERVAL_READ_15MIN_RAW`: additional ~10–15 min (materialized alongside canonical)
+2. 3.5B interval rows via monthly `INSERT ... SELECT FROM GENERATOR` batches: ~30 min
+3. Gap / event injection: ~5 min
 
-Estimated credit cost for full build: **8–15 credits**. Storage: **~180 GB** active, ~60 GB compressed.
+Steady-state storage: ~180 GB active data + ~30 GB metadata.
 
-### 4.6 Streaming demo slice (Phase 2)
-Concurrently, a Python producer running on the local workstation (or a small container) uses the `snowflake-ingest` SDK to stream a moving **rolling 60-minute window** of synthetic reads at real-time cadence (one read per meter per 15 min, scaled down to ~200 meters for the visible demo to keep the channel count manageable). This proves the blueprint end-to-end without 100K concurrent channels.
+### 4.6 Streaming slice
+Concurrently, a Python producer using the `snowflake-ingest` SDK streams a rolling 60-minute window of synthetic reads at real-time cadence (one read per meter per 15 min, scaled down to ~200 meters to keep the channel count manageable). This proves the blueprint end-to-end without 100K concurrent channels.
 
 ---
 
@@ -543,7 +538,7 @@ CREATE MASKING POLICY MP_ACCOUNT_ID AS (val VARCHAR) RETURNS VARCHAR ->
 ```
 
 ### 9.3 Sharing
-`AMI_SHARED` schema contains secure views over the billing & TOU marts. A native-app-style outbound share scaffolds regulator access. We will also stub a Cortex Analyst semantic view over `AMI_MART` so business users can ask natural language questions.
+`AMI_SHARED` schema contains secure views over the billing & TOU marts. A native-app-style outbound share scaffolds regulator access. A Cortex Analyst semantic view over `AMI_MART` exposes the same data to business users for natural-language querying.
 
 ---
 
@@ -592,77 +587,59 @@ Each test is its own SQL file under `/test/`.
 ## 12. Repo Layout
 
 ```
-/Users/rraman/Documents/AMI_use_case/
-├── use_case_description/
-│   └── AMI_Use_Cases_all_4_Snowflake-native data model and architecture.md
+.
+├── README.md
 ├── design/
-│   └── AMI_DESIGN_DOC.md          (this file)
+│   └── AMI_DESIGN_DOC.md              (this file)
+├── use_case_description/              Original solution brief
 ├── sql/
-│   ├── 00_foundation/             (database, schemas, warehouses, roles)
-│   ├── 01_dimensions/             (METER, SERVICE_POINT, CUSTOMER, TIME_DIM, TOU_*)
-│   ├── 02_raw/                    (INTERVAL_READ_15MIN_RAW, stages, pipes)
-│   ├── 03_canonical_dt/           (DT_INTERVAL_READ_15MIN)
-│   ├── 04_rollups/                (hourly / daily / monthly DTs)
-│   ├── 05_tou/                    (TOU tagged + charge line)
-│   ├── 06_billing/                (BILLING_PERIOD_CONSUMPTION + reconciliation)
-│   ├── 07_observability/          (audit, DMFs, SLA metrics, alerts)
-│   ├── 08_anomaly/                (training view, model, scoring task)
-│   ├── 09_security/               (RAP, masking, shares)
-│   └── 10_synthetic_data/         (bulk generators)
+│   ├── 00_foundation/                 Database, schemas, warehouses, roles
+│   ├── 01_dimensions/                 Dimension DDL + population
+│   ├── 02_raw/                        INTERVAL_READ_15MIN_RAW + METER_EVENT + stage
+│   ├── 03_canonical_dt/               Canonical INTERVAL_READ_15MIN
+│   ├── 04_rollups/                    Rollup dynamic-table chain + streaming blueprint DT
+│   ├── 05_tou/                        TOU tagging + charge line + billing consumption
+│   ├── 07_observability/              Audit, DMFs, SLA + DQ metrics, alert
+│   ├── 08_anomaly/                    Training view, model, scoring task
+│   ├── 09_security/                   Row-access policy, masking, secure views
+│   ├── 10_synthetic_data/             Bulk-generation procedure
+│   └── 11_semantic/                   Cortex Analyst semantic view
 ├── ingest/
-│   └── snowpipe_streaming_producer.py
+│   └── snowpipe_streaming_producer.py Live streaming producer
+├── dashboard-app/                     React + Express dashboard for SPCS
+│   ├── Dockerfile
+│   ├── service-spec.yaml
+│   ├── server/index.js
+│   └── src/
 ├── dashboards/
-│   └── snowsight_dashboard.sql    (or streamlit/)
-├── test/
-│   └── t*.sql, t*.py
-└── README.md
+│   └── snowsight_dashboard.sql        Reference queries for Snowsight tiles
+└── test/
+    └── 01_validation_suite.sql        End-to-end validation (T1–T9)
 ```
 
 ---
 
-## 13. Risks & Mitigations
+## 13. Consumption Layers
 
-| Risk | Likelihood | Impact | Mitigation |
-|---|---|---|---|
-| 3.5B row generation fails or exceeds credit budget | M | H | Do it in 12 monthly batches of ~290M; checkpoint after each; option to down-scale to 10K meters |
-| Per-meter anomaly models too expensive | M | M | Downgrade to per-feeder + sampled C&I per-meter (already planned) |
-| Snowpipe Streaming channel limit hit | L | M | Batch 10 meters / channel; 200 meters = 20 channels max |
-| DT target-lag not met due to large initial build | M | L | One-time backfill via MERGE; DTs start live from cutover timestamp |
-| Demo slowness from cold cache | M | L | Pre-warm key queries; keep query WH warm during demo |
-| Row-access policy blocks synthetic meter generation | L | L | Build policies at end, verify with test session |
+Two consumption surfaces are exposed on top of `AMI_MART` and `AMI_OBSERVABILITY`:
 
----
+### 13.1 React dashboard on Snowpark Container Services
 
-## 14. Credit & Storage Estimate
+A Vite + React single-page app with an Express backend is packaged as a Docker image and deployed as an SPCS service (`AMI_DASHBOARD_SVC`). Inside the container the backend authenticates to Snowflake via the OAuth token mounted at `/snowflake/session/token`, queries run through `AMI_QUERY_WH`, and results are cached in-process with 60–600 s TTLs.
 
-| Phase | Approx credits | Notes |
-|---|---|---|
-| Foundation + dims | < 0.1 | Tiny |
-| Synthetic generation | 8–15 | LARGE wh, 30–60 min |
-| DT initial backfill | 3–6 | Medium wh, full history pass |
-| Streaming demo (hour) | 0.5 | XS, active |
-| Anomaly train | 1–3 | Medium wh, feeder model |
-| Ongoing (per hour) | 0.1–0.2 | DT idle + 5-min scoring |
-| **One-time total** | **~15–25 credits** | |
+The UI renders five tabs — Ingestion, Data Quality, Billing, TOU Charges, Anomalies — each composed of KPIs, line / bar / area charts, and ranked tables backed by dedicated `/api/*` endpoints.
 
-Storage steady-state: ~180 GB active data + ~30 GB metadata = **~210 GB**.
+### 13.2 Cortex Analyst semantic view
+
+`AMI_MART.AMI_SEMANTIC_VIEW` is the business-facing semantic layer. It publishes seven tables (`daily_rollup`, `billing`, `charge_line`, `anomalies`, `meter`, `service_point`, `sla`), their relationships, curated facts and dimensions (territory, feeder, meter type, premise type, TOU bucket, rate plan, season), and a set of metrics (total kWh, billed kWh, billing-ready %, total energy / demand charge, anomaly count, average on-time %). Downstream Cortex Analyst and Agent endpoints can query it directly with natural language.
 
 ---
 
-## 15. Open Questions for You
+## 14. Design Choices
 
-Before I cut the first DDL, please confirm (or redirect):
-
-1. **Credit budget** — 15–25 credits for the one-time build acceptable? If not, I'll downscale to 10K meters (~350M rows, ~2–3 credits).
-2. **Live streaming scope** — is a 200-meter live slice enough for the demo, or do you want all 100K meters streaming? (latter requires ~1000 channels and ~$$$.)
-3. **Anomaly granularity** — confirm "per-feeder + sampled per-meter" (my recommendation), or go per-meter-only?
-4. **Dashboard surface** — Snowsight dashboard only, or also a small Streamlit in Snowflake app? I lean "Snowsight only + one SiS tab showing live ingestion" so we stay data-engineering-first.
-5. **Cortex Analyst on top** — scope it in now, or treat as stretch? It fits naturally on `AMI_MART` and gives a NL consumption layer for free.
-6. **RBAC depth** — full RAP + masking scaffold, or just owner role for the initial build? Full RBAC is more rigorous but adds ~1 day of work.
-7. **Region/time span** — 1 year of data ending today (2026-04-24)? Or a specific historical window you want anchored to a known event?
-
----
-
-## 16. Next step (once this doc is accepted)
-
-I will produce the **Phase 0 SQL files** (`/sql/00_foundation/` and `/sql/01_dimensions/`) for your review before any object is actually created in Snowflake. Nothing is executed without your go-ahead at each phase.
+- **One canonical grain, many marts.** Every rollup, TOU output, observability metric, and anomaly mart reads from `INTERVAL_READ_15MIN`. No parallel copies.
+- **VARIANT at the edge, typed downstream.** The streaming blueprint retains raw payloads for audit; `DT_NEW_READS_NORMALIZED` applies schema and last-write-wins dedup on `(METER_ID, READ_TS)`.
+- **Declarative freshness.** Dynamic Tables with target lags from 1 minute (canonical) to 1 hour (monthly) prove SLA without hand-rolled orchestration.
+- **Layered anomaly detection.** A per-feeder model for grid-level anomalies (2 000 series) plus a per-meter model on a sampled C&I cohort (500 series) captures both macro and behavioural shifts.
+- **Observability built in.** DMFs with anomaly detection watch row-count and freshness on RAW and canonical; derived SLA / DQ dynamic tables power the dashboard and SLA-breach alert.
+- **Security by default.** Row-access by territory, masking on CIS account IDs, secure views in a dedicated share-ready schema.
