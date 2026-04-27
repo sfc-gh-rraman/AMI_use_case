@@ -1,0 +1,23 @@
+spec:
+  containers:
+  - name: ami-dashboard
+    image: /ami_demo/ami_mart/ami_repo/ami-dashboard:latest
+    env:
+      HOSTNAME: "0.0.0.0"
+      PORT: "8080"
+      NODE_ENV: production
+      SNOWFLAKE_WAREHOUSE: AMI_QUERY_WH
+    resources:
+      requests:
+        memory: 512Mi
+        cpu: 250m
+      limits:
+        memory: 1Gi
+        cpu: 500m
+    readinessProbe:
+      port: 8080
+      path: /api/ingestion/kpi
+  endpoints:
+  - name: ami-ui
+    port: 8080
+    public: true
