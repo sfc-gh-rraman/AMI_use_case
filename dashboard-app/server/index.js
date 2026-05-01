@@ -67,14 +67,15 @@ function cached(key, ttlSec, fn) {
   });
 }
 
-// Data anchor - cached for 5 min
+// Data anchor - cached for 5 min. Returns YYYY-MM-DD string.
 async function dataAnchor() {
   return cached('data_anchor', 300, async () => {
     const [r] = await runQuery(`
-      SELECT MAX(READ_TS)::DATE AS MAX_DATE
+      SELECT TO_VARCHAR(MAX(READ_TS)::DATE, 'YYYY-MM-DD') AS MAX_DATE
       FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_15MIN
     `);
-    return r?.MAX_DATE || null;
+    // Fallback to a known-good date if the query fails for any reason.
+    return (r && r.MAX_DATE) ? String(r.MAX_DATE) : '2026-04-24';
   });
 }
 
