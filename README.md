@@ -19,7 +19,7 @@ See [`design/AMI_DESIGN_DOC.md`](design/AMI_DESIGN_DOC.md) for the architecture 
 | Database | `AMI_DEMO` |
 | Schemas | `AMI_RAW`, `AMI_CURATED`, `AMI_MART`, `AMI_OBSERVABILITY`, `AMI_ML`, `AMI_SHARED` |
 | Warehouses | `AMI_LOAD_WH` (L) · `AMI_DT_WH` (M) · `AMI_STREAM_WH` (XS) · `AMI_ML_WH` (M) · `AMI_QUERY_WH` (S) — auto-suspend 60 s |
-| Dynamic tables | `DT_NEW_READS_NORMALIZED`, `DT_HOURLY_ROLLUP`, `DT_DAILY_ROLLUP`, `DT_MONTHLY_ROLLUP`, `DT_INTERVAL_TOU_TAGGED`, `DT_INTERVAL_CHARGE_LINE`, `DT_BILLING_PERIOD_CONSUMPTION`, `DT_INGESTION_SLA_METRICS`, `DT_DATA_QUALITY_METRICS` |
+| Dynamic tables | `DT_NEW_READS_NORMALIZED`, `DT_CHANNEL_HOURLY_ROLLUP`, `DT_CHANNEL_DAILY_ROLLUP`, `DT_HOURLY_ROLLUP`, `DT_DAILY_ROLLUP`, `DT_MONTHLY_ROLLUP`, `DT_INTERVAL_TOU_TAGGED`, `DT_INTERVAL_CHARGE_LINE`, `DT_BILLING_PERIOD_CONSUMPTION`, `DT_INGESTION_SLA_METRICS`, `DT_DATA_QUALITY_METRICS` |
 | Cortex ML models | `ami_feeder_anom_model`, `ami_cni_meter_anom_model` |
 | Semantic view | `AMI_MART.AMI_SEMANTIC_VIEW` (Cortex Analyst) |
 | Data metric functions | `ROW_COUNT`, `FRESHNESS` with anomaly detection on RAW and canonical |
@@ -37,10 +37,11 @@ See [`design/AMI_DESIGN_DOC.md`](design/AMI_DESIGN_DOC.md) for the architecture 
 | Customers | 94 022 |
 | `TIME_DIM` (15-min grain) | 35 136 |
 | `BILLING_PERIOD` | 1 128 264 |
-| **`INTERVAL_READ_15MIN`** (canonical) | **3 496 053 979** |
-| `DT_HOURLY_ROLLUP` | 878 M |
-| `DT_DAILY_ROLLUP` | 36.6 M |
-| `DT_MONTHLY_ROLLUP` | 1.3 M |
+| `CHANNEL_CATALOG` / `METER_CHANNEL` | 11 / 303 000 |
+| **`INTERVAL_READ_CHANNEL`** (canonical, long form) | **10 593 043 753** |
+| `V_INTERVAL_READ_15MIN_WIDE` (back-compat view) | ~3.5 B |
+| `DT_CHANNEL_HOURLY_ROLLUP` / `DT_CHANNEL_DAILY_ROLLUP` | 2.66 B / 110.9 M |
+| `DT_HOURLY_ROLLUP` / `DT_DAILY_ROLLUP` / `DT_MONTHLY_ROLLUP` | 878 M / 36.6 M / 1.3 M |
 | `DT_INTERVAL_CHARGE_LINE` | 3.22 B |
 
 ---
@@ -228,9 +229,11 @@ SELECT * FROM SEMANTIC_VIEW(
 
 ## Key design choices
 
-- **One canonical grain, many marts**: every rollup, TOU output, observability metric, and anomaly mart reads from `INTERVAL_READ_15MIN`. No alternate copies.
-- **VARIANT at the edge, typed downstream**: the streaming blueprint retains raw payloads for audit; `DT_NEW_READS_NORMALIZED` applies schema with last-write-wins dedup on `(METER_ID, READ_TS)`.
-- **Declarative freshness**: Dynamic Tables with target lags from 1 minute (canonical) to 1 hour (monthly) let the platform prove SLA without hand-rolled orchestration.
-- **Layered anomaly detection**: a per-feeder model for grid-level anomalies (2 000 series) plus a per-meter model on a sampled C&I cohort (500 series) captures both macro and behavioural shifts.
-- **Data-quality observability built-in**: DMFs with anomaly detection watch row-count and freshness on RAW and canonical; derived SLA / DQ dynamic tables power the dashboard.
-- **Security by default**: row-access by territory, masking on CIS account IDs, secure views in a dedicated share-ready schema.
+- **Channel-keyed grain.** The canonical fact `INTERVAL_READ_CHANNEL` is keyed on `(METER_ID, CHANNEL_ID, READ_TS)` — one row per measurement stream. A `CHANNEL_CATALOG` reference table + per-meter `METER_CHANNEL` dimension let the platform onboard new channels (KVARH, reactive demand, per-phase voltage) by adding rows, not by altering schema. A `V_INTERVAL_READ_15MIN_WIDE` view pivots back to the per-meter grain for consumers that want it.
+- **One canonical grain, many marts.** Every rollup, TOU output, observability metric, and anomaly mart reads from the same canonical fact. No parallel copies.
+- **VARIANT at the edge, typed downstream.** The streaming blueprint retains raw payloads for audit; `DT_NEW_READS_NORMALIZED` applies schema and last-write-wins dedup on `(METER_ID, READ_TS)`.
+- **Declarative freshness.** Dynamic Tables with target lags from 1 minute (canonical) to 1 hour (monthly) prove SLA without hand-rolled orchestration.
+- **Channel-aware aggregation.** Rollup DTs pick SUM / MAX / MIN / AVG from `METER_CHANNEL.AGGREGATION` at runtime — one rule table, any number of channels.
+- **Layered anomaly detection.** A per-feeder model for grid-level anomalies (2 000 series) plus a per-meter model on a sampled C&I cohort (500 series) captures both macro and behavioural shifts.
+- **Observability built in.** DMFs with anomaly detection watch row-count and freshness on RAW and canonical; derived SLA / DQ dynamic tables power the dashboard and SLA-breach alert.
+- **Security by default.** Row-access by territory, masking on CIS account IDs, secure views in a dedicated share-ready schema.

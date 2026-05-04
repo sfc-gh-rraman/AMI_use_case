@@ -66,27 +66,46 @@ Although we treat them as four accelerators, they are **one unified data product
 | Entity | Grain | Volume (1 yr, 100K mtrs) |
 |---|---|---|
 | `INTERVAL_READ_15MIN_RAW` | 1 VARIANT row / read as landed | ~3.5B (retained 30d hot, then purged) |
-| `INTERVAL_READ_15MIN` | 1 row / meter / 15-min UTC | ~3.5B |
+| `INTERVAL_READ_CHANNEL` | 1 row / meter / channel / 15-min UTC | ~10.6B |
 | `METER_EVENT` | 1 row / event | ~5–10M (outages, tampers, comms) |
+| `V_INTERVAL_READ_15MIN_WIDE` | 1 row / meter / 15-min UTC (back-compat view) | ~3.5B |
 
-**Canonical columns for `INTERVAL_READ_15MIN`:**
+**Channel model.** A smart meter emits several measurement streams (channels) in
+parallel — delivered energy, received energy, peak demand, voltage, and so on.
+The canonical fact is keyed by **`(METER_ID, CHANNEL_ID, READ_TS)`** so each
+stream carries its own unit, direction, and aggregation rule. Two supporting
+tables make the model vendor-neutral and extensible:
+
+- `CHANNEL_CATALOG` — reference of channel codes (e.g., `KWH_DEL`, `KW_DEM`,
+  `VOLT_AVG`, `KVARH_D`, `AMPS`) with UOM, direction, flow type, and
+  aggregation rule.
+- `METER_CHANNEL` — per-meter instantiation. Residential meters carry 3 channels
+  (plus `KWH_REC` if they have DER); SMB/C&I carry more as the catalog is
+  expanded.
+
+**Canonical columns for `INTERVAL_READ_CHANNEL`:**
 ```
 METER_ID              VARCHAR         NOT NULL
-READ_TS               TIMESTAMP_TZ    NOT NULL   -- UTC, 15-min aligned
-READ_LOCAL_TS         TIMESTAMP_NTZ              -- in meter's local tz
-KWH_DELIVERED         NUMBER(14,4)               -- energy to customer
-KWH_RECEIVED          NUMBER(14,4)               -- energy back (DER / solar)
-DEMAND_KW             NUMBER(10,4)               -- max demand in interval
-VOLTAGE_V             NUMBER(6,2)
-QUALITY_FLAG          VARCHAR                    -- 'A' (actual), 'E' (estimated), etc
-VEE_STATUS            VARCHAR                    -- 'VALID' | 'ESTIMATED' | 'EDITED' | 'FAILED'
-ESTIMATION_METHOD     VARCHAR                    -- nullable
-EVENT_ID              VARCHAR                    -- nullable FK to METER_EVENT
-SOURCE_FILE           VARCHAR                    -- provenance
-INGESTED_AT           TIMESTAMP_NTZ              -- system arrival
-INGESTION_LAG_SEC     NUMBER                     -- INGESTED_AT - READ_TS
+CHANNEL_ID            VARCHAR         NOT NULL   -- METER_ID || '-' || CHANNEL_CODE
+CHANNEL_CODE          VARCHAR         NOT NULL
+READ_TS               TIMESTAMP_NTZ   NOT NULL   -- UTC, 15-min aligned
+VALUE                 NUMBER(14,4)               -- numeric value in channel UOM
+UOM                   VARCHAR                    -- KWH, KW, V, KVARH, A, ...
+QUALITY_FLAG          VARCHAR
+VEE_STATUS            VARCHAR
+ESTIMATION_METHOD     VARCHAR
+EVENT_ID              VARCHAR
+UTILITY_TERRITORY     VARCHAR
+SOURCE_FILE           VARCHAR
+INGESTED_AT           TIMESTAMP_NTZ
+INGESTION_LAG_SEC     NUMBER
 ```
-Primary key: `(METER_ID, READ_TS)`. Clustered on `(READ_TS, METER_ID)` to favor time-range scans first (most queries are "last N days across meters").
+Primary key: `(METER_ID, CHANNEL_ID, READ_TS)`. Clustered on
+`(READ_TS, METER_ID, CHANNEL_CODE)` to favour time-range scans first.
+
+`V_INTERVAL_READ_15MIN_WIDE` pivots the long-form fact back to a per-meter /
+per-interval row so the existing rollup / TOU / observability DTs and the React
+dashboard keep working without modification.
 
 ### 2.3 Rollups & billing
 
@@ -643,3 +662,50 @@ The UI renders five tabs — Ingestion, Data Quality, Billing, TOU Charges, Anom
 - **Layered anomaly detection.** A per-feeder model for grid-level anomalies (2 000 series) plus a per-meter model on a sampled C&I cohort (500 series) captures both macro and behavioural shifts.
 - **Observability built in.** DMFs with anomaly detection watch row-count and freshness on RAW and canonical; derived SLA / DQ dynamic tables power the dashboard and SLA-breach alert.
 - **Security by default.** Row-access by territory, masking on CIS account IDs, secure views in a dedicated share-ready schema.
+
+In AMI / MDMS, a channel is a distinct measurement stream coming off a single meter — basically "what is being measured." One physical meter typically emits several channels in parallel, and each channel has its own interval series.
+
+Why channels exist
+A smart meter doesn't just record "kWh used." It measures multiple electrical quantities simultaneously, and depending on the customer type it may do so in both directions. Each of those quantities is stored as a separate time series keyed by (meter_id, channel_id, interval_ts) so billing, analytics, and VEE can treat them independently.
+
+Typical channels on a residential meter
+Channel	Unit	What it measures
+kWh Delivered	kWh	Energy consumed by the premise
+kWh Received	kWh	Energy pushed back to the grid (solar/DER export)
+kW Demand	kW	Peak real-power demand in the interval
+kVARh / kVAR	reactive	Reactive energy / demand (commercial)
+Voltage	V	Average / min / max in the interval
+Current	A	Amperage draw
+Power factor	ratio	kW / kVA
+A C&I meter can have 8–16 channels (each phase separately, plus forward/reverse real and reactive).
+
+Channel attributes in the MDMS data model
+Each channel usually carries:
+
+CHANNEL_ID (e.g., 1, 3, 5 following an industry numbering like ANSI C12.19 or a vendor-specific scheme)
+UOM (unit of measure: kWh, kW, V, …)
+DIRECTION (delivered / received / net)
+FLOW_TYPE (real / reactive / apparent)
+INTERVAL_LENGTH (15 min, 5 min, 1 min — some channels can be higher resolution)
+AGGREGATION (SUM for kWh, MAX for kW demand, AVG for voltage)
+SCALE_FACTOR (meter multiplier, e.g., CT/PT ratios for C&I)
+What you'd change in this data model
+Right now INTERVAL_READ_15MIN is pivoted: one row holds KWH_DELIVERED, KWH_RECEIVED, DEMAND_KW, VOLTAGE_V as columns. That's the "wide / pre-pivoted" pattern — convenient but rigid.
+
+A proper channel-oriented ("long / EAV") model would look like:
+
+Same 3.5 B-interval volume becomes ~12–17 B rows (because each meter now emits ~4–5 channels instead of being pre-pivoted), but the model becomes:
+
+Extensible — adding a new measurement (e.g., THD, reactive demand) is just another row in METER_CHANNEL, no schema change to the fact.
+Heterogeneous-ready — residential meters with 2 channels and C&I meters with 16 coexist naturally.
+Vendor-neutral — Itron, Landis+Gyr, Sensus all use slightly different channel numbering; the metadata table absorbs that.
+Aggregation-aware — the rollup layer can look up the right aggregator (SUM vs MAX vs AVG) from METER_CHANNEL.AGGREGATION instead of hard-coding per column.
+Interval-resolution-aware — high-frequency channels (e.g., 1-min voltage) and 15-min energy channels coexist cleanly.
+How TOU and VEE relate to channels
+TOU pricing is typically applied to a specific channel set — usually the delivered-kWh channel and the kW-demand channel. Received-kWh may have its own export-credit rate (net metering) or a different rate plan entirely.
+VEE runs per-channel, not per-meter. A meter might have a valid kWh channel but a failed voltage channel in the same interval.
+Billing aggregates specific channels (SUM of delivered-kWh, MAX of demand-kW) over the billing period.
+
+
+To-Dos:
+1. Channels 2. Gaps 3. Dashboard view - add transformers, drill down by time period, events, dollar value, geographical view (add equipment view + maps), observability tabs 4. Snowflake Intelligence - build the semantic view, build the agents and search and embed the dashboard view.
