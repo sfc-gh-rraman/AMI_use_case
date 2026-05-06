@@ -652,15 +652,32 @@ Two consumption surfaces are exposed on top of `AMI_MART` and `AMI_OBSERVABILITY
 
 A Vite + React single-page app (`dashboard-app/`) with an Express backend is packaged as a Docker image and deployed as an SPCS service (`AMI_DASHBOARD_SVC`). Locally it runs on port 5173 (frontend) + 8080 (backend) for development.
 
+![AMI 2.0 landing page — typing-effect hero, live KPI bar, feature grid, hidden-insight callout, quick links to every tab](screenshots/01_landing.png)
+
 **Auth.** In SPCS the backend authenticates to Snowflake via the OAuth token mounted at `/snowflake/session/token`. Locally the same code path falls back to PAT via `SNOWFLAKE_PAT` / `SNOWFLAKE_PASSWORD`.
 
 **Caching.** Every endpoint is wrapped in `cached(key, ttl_seconds, fn)` with TTLs of 60–600 s based on data volatility. Hot endpoints (KPIs) are 60 s; rollup tables (transformer load, anomaly summaries) are 300–600 s. Two queries on the same tab generally hit cache.
 
-**Tabs (10).** Ingestion · Data Quality · Billing · TOU Charges · Transformers · Map · Events · Anomalies · Observability · Intelligence.
+**Tabs (11).** **Home** (landing) · Ingestion · Data Quality · Billing · TOU Charges · Transformers · Map · Events · Anomalies · Observability · Intelligence.
 
 **Visual system.** Navy/atlas dark theme, JetBrains Mono / Space Grotesk fonts, Lucide icons, Recharts + Vega-Lite for visualisation, Leaflet (Carto dark tiles) for maps. Sidebar collapses; status footer shows live row counts (`100K meters · 10.6B intervals`).
 
+#### 13.1.0 Home — Landing page
+
+The default route on app load. Modeled on the *construction_capital_delivery* reference app, it is a marketing-style entry point that orients first-time viewers before they hit the operational tabs:
+
+- **Animated hero** — `AMI 2.0` gradient title, tagline, and a typing-effect intro line (`Hello. I'm AMI 2.0 — your Snowflake-native metering platform. Pick a starting point below.`)
+- **Live stats bar** — four KPIs pulled from `/api/ingestion/kpi`, `/api/billing/stats`, `/api/anomaly/kpi`: interval rows (10.6B → rendered as 3.5B+ rolling), meters (100K), billing readiness (~53.7%), feeder anomalies (~1 280)
+- **Two CTAs** — `Open Operations Console` (→ Anomaly tab) and `Talk to AMI Intelligence` (→ Intelligence tab)
+- **Feature grid (4)** — Streaming Ingestion · DT Chains · Cortex ML Anomaly Detection · Cortex Agent + Search, each with one-paragraph elevator pitch
+- **Hidden-insight callout** — surfaces the per-transformer rollup story (§16.2) so the reviewer sees the "Cortex ML legibility" narrative before clicking into the Anomaly tab
+- **Quick-links grid (8)** — Anomalies, Intelligence, Map, Billing, Transformers, TOU, Ingestion, Observability — each with a one-line description for what the tab proves
+
+Wired via `App.jsx` as the default `page='home'` state; navigation prop (`onNavigate`) is passed only to the Landing page, all other pages stay state-prop-free.
+
 #### 13.1.1 Anomaly tab — flagship narrative
+
+![Anomaly tab — KPI strip, two model cards, forecast band with drag-to-zoom, top-15 feeder anomalies, per-transformer rollup, drill-down](screenshots/09_anomalies.png)
 
 The Anomaly tab carries the bulk of the "make Cortex ML legible" narrative.
 
@@ -674,6 +691,8 @@ The Anomaly tab carries the bulk of the "make Cortex ML legible" narrative.
 - **Injected-anomaly ground-truth panel:** for model validation — 50 theft meters, 30 dead meters, 20 voltage-sag meters, with windows.
 
 #### 13.1.2 Intelligence tab — Snowflake Intelligence in the dashboard
+
+![Intelligence tab — streaming chat with text, SQL, citations, and an inline Vega-Lite chart from data_to_chart](screenshots/11_intelligence.png)
 
 A streaming chat surface that talks to a Cortex Agent (`AMI_DEMO.AMI_MART.AMI_INTELLIGENCE_AGENT`) configured with three tools:
 
@@ -695,9 +714,23 @@ A streaming chat surface that talks to a Cortex Agent (`AMI_DEMO.AMI_MART.AMI_IN
 
 #### 13.1.3 Other tabs
 
+- **Ingestion** — 48h hourly reads by territory (auto-padded y-axis), late-arrival timeline, on-time SLA tile
+
+  ![Ingestion tab](screenshots/02_ingestion.png)
+
+- **Billing** — readiness % vs. held-bill $ exposure, monthly trend (dual-axis), reason mix
+
+  ![Billing tab — readiness trend dual-axis chart, reason breakdown](screenshots/04_billing.png)
+
 - **Map** (`/api/map/feeders`): Leaflet with Carto dark-all tiles, ~2 000 feeder markers coloured by health and clustered. Marker popup shows feeder ID, transformer count, meter count, on-time %, anomaly count.
-- **Transformers**: 30d load-factor leaderboard, per-territory transformer-count breakdown, KVA-vs-load scatter
-- **Ingestion / Data Quality / Billing / TOU Charges / Events / Observability**: per-domain KPIs, time-series, ranked tables (the original five tabs from the early build, hardened)
+
+  ![Feeder map — ~2 000 markers coloured by health on a Carto dark base](screenshots/07_map.png)
+
+- **Transformers**: 30d load-factor leaderboard, per-territory transformer-count breakdown, kVA-vs-load scatter
+
+  ![Transformers tab — leaderboard, kVA-vs-load distribution](screenshots/06_transformers.png)
+
+- **Data Quality / TOU Charges / Events / Observability**: per-domain KPIs, time-series, ranked tables (the original tabs from the early build, hardened)
 
 #### 13.1.4 Dollar overlays (placeholder)
 
@@ -1145,7 +1178,81 @@ The Cortex Agent (`AMI_DEMO.AMI_MART.AMI_INTELLIGENCE_AGENT`) is configured with
 
 Until tariffs land we use a flat placeholder rate (`$0.15/kWh`) and population-average kWh per interval / per bill. Every `$` figure carries an explicit `@ $0.15/kWh placeholder` caption so it's never misread as authoritative. The full overlay matrix is in §13.1.4. Replacement plan when §15 ships: every `RATE_PER_KWH * kwh` expression becomes a SCD2-resolved `tariff_resolved_rate(meter, ts) * kwh` lookup, no UI change required beyond removing the caption.
 
-### 16.5 Local-first development workflow
+### 16.5 Chart polish — y-axis padding and drag-to-zoom
+
+Two issues surfaced once charts were stacked dense on the page:
+
+1. **Flatlines from a 0-baseline.** Recharts auto-scales y-axes from 0 by default. With territory hourly reads in the 95K–104K range, the chart looked like four parallel horizontal lines — the legitimate ±5% fluctuation was crushed against the zero floor. Same pattern on the Billing readiness chart (51%–54% squashed to a single band) and the TOU charges line.
+2. **No granular view.** Reviewers wanted to "build a box" around an interesting period (a spike, a drop) and see it expanded — but without losing the default 168-hour overview that frames the narrative.
+
+Both are solved with two small additions to `dashboard-app/src/components/UI.jsx`:
+
+```js
+// Auto-pad domain ±5% around data extremes, never below 0
+export const yPadDomain = (pad = 0.05) => [
+  (dataMin) => Math.max(0, dataMin - (Math.abs(dataMin) * pad || 1)),
+  (dataMax) => dataMax + (Math.abs(dataMax) * pad || 1),
+]
+
+// Compact tick formatter (3.5B / 95k / 53.7%)
+export const yAbbr = (v) => { /* B/M/k formatting */ }
+
+// Drag-to-zoom hook — Recharts mouse-event wrapper
+export function useDragZoom() {
+  const [drag, setDrag] = useState(null)   // {x1, x2} during drag
+  const [zoom, setZoom] = useState(null)   // {x1, x2} after release
+  const handlers = {
+    onMouseDown: (e) => e?.activeLabel && setDrag({ x1: e.activeLabel, x2: e.activeLabel }),
+    onMouseMove: (e) => drag && e?.activeLabel && setDrag(d => ({ ...d, x2: e.activeLabel })),
+    onMouseUp:   ()  => { if (drag && drag.x1 !== drag.x2) setZoom(drag); setDrag(null) },
+    onMouseLeave:()  => setDrag(null),
+  }
+  const slice = (data, key='ts') => { /* return data.slice between x1..x2 */ }
+  return { drag, zoom, handlers, slice, reset: () => setZoom(null) }
+}
+```
+
+**Pattern in a page:**
+
+```jsx
+const dz = useDragZoom()
+<LineChart {...dz.handlers}>
+  <YAxis domain={yPadDomain()} tickFormatter={yAbbr}/>
+  <Line .../>
+  {dz.drag && <ReferenceArea x1={dz.drag.x1} x2={dz.drag.x2} fillOpacity={0.15}/>}
+</LineChart>
+{dz.zoom && (
+  <ZoomedView data={dz.slice(rows)} onReset={dz.reset}/>  // auto-fit y-axis below
+)}
+```
+
+Applied across **Anomaly forecast band, Ingestion territory line, TOU monthly charges, Billing readiness trend** — same hook, same UX, no per-page state.
+
+The zoomed-in view appears below the original chart in a slide-in panel (`animate-slide-in`), preserving the 168-hour overview while exposing the granular detail. A `Reset zoom` button clears `zoom` state.
+
+### 16.6 Billing readiness trend — the "is it getting better?" view
+
+A common reviewer question on the Billing tab was "what does the *trend* look like?" — the existing KPI strip only showed a single point-in-time `53.73%` figure.
+
+Added `/api/billing/readiness-trend`:
+
+```sql
+SELECT
+  TO_VARCHAR(START_DATE,'YYYY-MM') AS PERIOD,
+  COUNT(*) AS TOTAL,
+  COUNT_IF(IS_BILLING_READY) AS READY,
+  COUNT_IF(NOT IS_BILLING_READY) AS NOT_READY,
+  ROUND(COUNT_IF(IS_BILLING_READY) / COUNT(*) * 100, 2) AS PCT_READY,
+  ROUND(COUNT_IF(NOT IS_BILLING_READY) * 750 * 0.15 / 1e6, 2) AS DOLLARS_HELD_M
+FROM AMI_DEMO.AMI_MART.DT_BILLING_PERIOD_CONSUMPTION
+GROUP BY 1 ORDER BY 1
+```
+
+Rendered as a Recharts `ComposedChart` with **dual y-axis**: left axis is `% Ready` (range 51.68–54.39%, auto-padded), right axis is `$M Held` (4.82M–5.11M). Both share a 12-month x-axis. The left axis answers "are we improving?"; the right answers "what's the dollar exposure trend?". A single chart, two answers.
+
+**Granularity caveat (acknowledged in the chart subtitle).** Bills are issued monthly; the underlying `DT_BILLING_PERIOD_CONSUMPTION` has 12 distinct `PERIOD` values, so the trend is **monthly only** — not a daily time-series. Honest framing matters: this is a billing-cycle reframe, not high-frequency telemetry.
+
+### 16.7 Local-first development workflow
 
 The dashboard runs end-to-end locally before any SPCS push:
 
@@ -1158,7 +1265,7 @@ PORT=8080 SNOWFLAKE_PAT=...          # express backend on :8080
 
 PAT auth replaces SPCS OAuth-token mount. The same `connection.js` logic detects which is present and uses it. This decouples UI iteration from container build/push cycles (~30s vs ~5m).
 
-### 16.6 Reference-app patterns — deferred
+### 16.8 Reference-app patterns — deferred
 
 These are documented for future sessions. Each is a discrete, additive lift:
 
@@ -1171,18 +1278,18 @@ These are documented for future sessions. Each is a discrete, additive lift:
 - **Map heat overlay** — feeder markers coloured by aggregate $ value-at-risk, with a slider that toggles between "Health" and "$ at Risk"
 - **AIThinking on KPI hover** — exposes the agent's reasoning/explanation for any KPI card on demand
 
-### 16.7 What's NOT shipped (cross-reference)
+### 16.9 What's NOT shipped (cross-reference)
 
 | Feature | Section | Why deferred |
 |---|---|---|
 | Tariff model + Value-at-Risk DT + Ops Queue tab | §15 | Significant build work (≈2.5 days) — left as plan-of-record |
 | Per-transformer Cortex ML scoring | §16.2 trade-off | Proportional attribution is sufficient for current narrative |
 | Drift indicator | §16.1 | Single-period scoring data — drift over time pending more model runs |
-| Map heat overlay by $-VAR | §16.6 | Depends on §15 |
-| Customer-class lens | §16.6 | Depends on §15 |
+| Map heat overlay by $-VAR | §16.8 | Depends on §15 |
+| Customer-class lens | §16.8 | Depends on §15 |
 | SPCS redeploy of polished UI | — | Awaiting `EXTERNAL_NETWORK_ACCESS_RULE` for Carto tile CDN |
 
-### 16.8 Repo layout (frontend)
+### 16.10 Repo layout (frontend)
 
 ```
 dashboard-app/

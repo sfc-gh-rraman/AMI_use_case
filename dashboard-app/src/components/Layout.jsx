@@ -1,11 +1,12 @@
 import { useState } from 'react'
 import {
   Activity, Database, ShieldCheck, Receipt, Calculator, Cpu,
-  AlertTriangle, MapPin, Bell, Wrench, Sparkles,
+  AlertTriangle, MapPin, Bell, Wrench, Sparkles, Home,
   ChevronLeft, ChevronRight
 } from 'lucide-react'
 
 const NAV = [
+  { id: 'home',          label: 'Home',          icon: Home },
   { id: 'ingestion',     label: 'Ingestion',     icon: Database },
   { id: 'dq',            label: 'Data Quality',  icon: ShieldCheck },
   { id: 'billing',       label: 'Billing',       icon: Receipt },
