@@ -3,7 +3,7 @@ import {
   ComposedChart, Line, Area, Scatter, XAxis, YAxis, Tooltip,
   ResponsiveContainer, CartesianGrid, Legend
 } from 'recharts'
-import { AlertTriangle, Activity, Zap, BookOpen, Sparkles, Brain, X, ChevronRight } from 'lucide-react'
+import { AlertTriangle, Activity, Zap, BookOpen, Sparkles, Brain, X, ChevronRight, Layers } from 'lucide-react'
 import { api, fmt } from '../components/api'
 import { KpiCard, Panel, Empty, Loading } from '../components/UI'
 
@@ -176,12 +176,14 @@ export default function Anomaly() {
   const [top, setTop] = useState([])
   const [meters, setMeters] = useState([])
   const [card, setCard] = useState(null)
+  const [xfm, setXfm] = useState([])
   const [drill, setDrill] = useState(null)
   useEffect(() => {
     api('anomaly/kpi').then(d => setKpi(d || {}))
     api('anomaly/top-feeders').then(d => setTop(Array.isArray(d) ? d : []))
     api('anomaly/top-meters').then(d => setMeters(Array.isArray(d) ? d : []))
     api('anomaly/model-card').then(d => setCard(d))
+    api('anomaly/by-transformer').then(d => setXfm(Array.isArray(d) ? d : []))
   }, [])
   return (
     <div className="p-6 space-y-4">
@@ -242,6 +244,64 @@ export default function Anomaly() {
             </tbody>
           </table>
         )}
+      </Panel>
+
+      <Panel title="Per-transformer rollup of feeder anomalies"
+        right={<div className="flex items-center gap-2">
+          <Layers size={11} className="text-atlas-cyan"/>
+          <span className="text-[10px] text-slate-500 uppercase tracking-wider">
+            Excess kWh allocated by 30d load share · click to drill the parent feeder
+          </span>
+        </div>}>
+        {xfm.length === 0 ? <Empty/> : (
+          <table className="w-full text-xs">
+            <thead className="text-slate-400 border-b border-navy-700">
+              <tr>
+                <th className="text-left p-2 font-medium">Transformer</th>
+                <th className="text-left p-2 font-medium">Feeder</th>
+                <th className="text-right p-2 font-medium">kVA</th>
+                <th className="text-right p-2 font-medium">Meters</th>
+                <th className="text-right p-2 font-medium">Anomaly hours</th>
+                <th className="text-right p-2 font-medium">Load share</th>
+                <th className="text-right p-2 font-medium">Est. excess kWh</th>
+                <th className="text-right p-2 font-medium">$ Exposure</th>
+                <th className="text-right p-2 font-medium">Max σ</th>
+                <th className="w-6"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {xfm.map((r,i) => {
+                // build a synthetic drill row for the side panel using feeder context
+                const onClick = () => {
+                  const feederRow = top.find(f => f.feeder_id === r.feeder_id) ||
+                    { feeder_id: r.feeder_id, ts: '—', kwh: 0, forecast: 0, upper_bound: 0, distance: r.max_distance }
+                  setDrill({ ...feederRow, _via_xfm: r.transformer_id })
+                }
+                return (
+                  <tr key={i} onClick={onClick}
+                    className="border-b border-navy-800/60 hover:bg-navy-700/30 cursor-pointer transition-colors">
+                    <td className="p-2 font-mono text-slate-300">{r.transformer_id}</td>
+                    <td className="p-2 font-mono text-atlas-blue">{r.feeder_id}</td>
+                    <td className="p-2 text-right text-slate-400 font-mono">{r.kva}</td>
+                    <td className="p-2 text-right text-slate-400 font-mono">{r.meters}</td>
+                    <td className="p-2 text-right text-slate-300 font-mono">{r.feeder_anomaly_hours}</td>
+                    <td className="p-2 text-right text-slate-300 font-mono">{r.share_pct}%</td>
+                    <td className="p-2 text-right text-atlas-yellow font-mono">{r.est_excess_kwh}</td>
+                    <td className="p-2 text-right font-mono text-atlas-green">${r.est_dollar_exposure}</td>
+                    <td className="p-2 text-right font-mono text-atlas-red">{r.max_distance}</td>
+                    <td className="p-2 text-slate-500"><ChevronRight size={14}/></td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+        <div className="mt-3 text-[11px] text-slate-500 leading-relaxed">
+          <Sparkles size={11} className="inline mr-1 text-atlas-purple"/>
+          For each anomaly hour at the feeder, the excess kWh (actual − forecast) is allocated
+          to its transformers in proportion to their 30-day share of the feeder's load. Top 25
+          transformers shown; ranked by estimated $ exposure at the placeholder rate.
+        </div>
       </Panel>
 
       <Panel title="Top 15 per-meter anomalies (CNI sample)">

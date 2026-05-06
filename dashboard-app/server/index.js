@@ -313,6 +313,68 @@ app.get('/api/anomaly/top-meters', async (_req, res) => {
   } catch (e) { console.error('anom_meters', e); res.status(500).json({ error: e.message }); }
 });
 
+// --- Per-transformer anomaly rollup ---------------------------------------
+// For each feeder anomaly, attribute the excess kWh to its transformers in
+// proportion to the transformer's 30d share of feeder load. Estimates a
+// $ exposure per transformer at the placeholder rate.
+app.get('/api/anomaly/by-transformer', async (_req, res) => {
+  try {
+    const data = await cached('anom_xfm', 600, async () => {
+      const rows = await runQuery(`
+        WITH xfm_share AS (
+          SELECT t.TRANSFORMER_ID, t.FEEDER_ID, t.KVA_RATING,
+                 COUNT(DISTINCT sp.SERVICE_POINT_ID) AS METERS,
+                 SUM(d.KWH_DELIVERED) AS XFM_KWH_30D
+          FROM AMI_DEMO.AMI_CURATED.TRANSFORMER t
+          JOIN AMI_DEMO.AMI_CURATED.SERVICE_POINT sp USING(TRANSFORMER_ID)
+          JOIN AMI_DEMO.AMI_CURATED.METER m USING(SERVICE_POINT_ID)
+          JOIN AMI_DEMO.AMI_CURATED.DT_DAILY_ROLLUP d USING(METER_ID)
+          WHERE d.ROLLUP_TS >= DATEADD(day,-30,
+            (SELECT MAX(ROLLUP_TS) FROM AMI_DEMO.AMI_CURATED.DT_DAILY_ROLLUP))
+          GROUP BY 1,2,3
+        ),
+        feeder_kwh AS (
+          SELECT FEEDER_ID, SUM(XFM_KWH_30D) AS FEEDER_KWH_30D
+          FROM xfm_share GROUP BY 1
+        ),
+        anom_per_feeder AS (
+          SELECT FEEDER_ID,
+                 COUNT(*)                              AS N_HOURS,
+                 SUM(GREATEST(KWH-FORECAST, 0))        AS FEEDER_EXCESS_KWH,
+                 AVG(DISTANCE)                         AS AVG_DISTANCE,
+                 MAX(DISTANCE)                         AS MAX_DISTANCE
+          FROM AMI_DEMO.AMI_MART.AMI_ANOMALY_EVENTS
+          WHERE IS_ANOMALY GROUP BY 1
+        )
+        SELECT
+          x.TRANSFORMER_ID, x.FEEDER_ID, x.KVA_RATING::NUMBER(8,1) AS KVA, x.METERS,
+          ap.N_HOURS AS FEEDER_ANOMALY_HOURS,
+          ((x.XFM_KWH_30D / NULLIF(f.FEEDER_KWH_30D,0)) * 100)::NUMBER(5,2) AS SHARE_PCT,
+          ((x.XFM_KWH_30D / NULLIF(f.FEEDER_KWH_30D,0)) * ap.FEEDER_EXCESS_KWH)::NUMBER(12,2) AS EST_EXCESS_KWH,
+          ((x.XFM_KWH_30D / NULLIF(f.FEEDER_KWH_30D,0)) * ap.FEEDER_EXCESS_KWH * 0.15)::NUMBER(12,2) AS EST_DOLLAR_EXPOSURE,
+          ap.MAX_DISTANCE::NUMBER(6,3) AS MAX_DISTANCE
+        FROM xfm_share x
+        JOIN feeder_kwh f USING(FEEDER_ID)
+        JOIN anom_per_feeder ap USING(FEEDER_ID)
+        ORDER BY EST_DOLLAR_EXPOSURE DESC NULLS LAST
+        LIMIT 25
+      `);
+      return rows.map(r => ({
+        transformer_id: r.TRANSFORMER_ID,
+        feeder_id: r.FEEDER_ID,
+        kva: Number(r.KVA),
+        meters: Number(r.METERS),
+        feeder_anomaly_hours: Number(r.FEEDER_ANOMALY_HOURS),
+        share_pct: Number(r.SHARE_PCT),
+        est_excess_kwh: Number(r.EST_EXCESS_KWH),
+        est_dollar_exposure: Number(r.EST_DOLLAR_EXPOSURE),
+        max_distance: Number(r.MAX_DISTANCE),
+      }));
+    });
+    res.json(data);
+  } catch (e) { console.error('anom_xfm', e); res.status(500).json({ error: e.message }); }
+});
+
 // --- Forecast band per feeder (last 7d) ---------------------------------
 app.get('/api/anomaly/forecast/:feeder_id', async (req, res) => {
   try {
