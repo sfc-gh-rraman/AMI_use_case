@@ -59,3 +59,34 @@ export const yAbbr = (v) => {
   if (a >= 1)   return sign + a.toFixed(1).replace(/\.0$/, '')
   return sign + a.toFixed(2)
 }
+
+// Drag-to-zoom hook for Recharts line/area charts.
+// Returns chart event handlers, current drag/zoom state, a slicer for the
+// committed selection, and a reset(). Pattern:
+//   const z = useDragZoom()
+//   <LineChart {...z.handlers}>
+//     {z.drag && <ReferenceArea x1={z.drag.x1} x2={z.drag.x2} ... />}
+//     {z.zoom && <ReferenceArea x1={z.zoom.x1} x2={z.zoom.x2} ... />}
+//   </LineChart>
+//   {z.slice(data, 'ts')?.length > 1 && <ZoomedChart data={z.slice(data,'ts')}/>}
+//   {z.zoom && <button onClick={z.reset}>Reset</button>}
+import { useState as _us } from 'react'
+export function useDragZoom() {
+  const [drag, setDrag] = _us(null)
+  const [zoom, setZoom] = _us(null)
+  const handlers = {
+    onMouseDown: (e) => { if (e?.activeLabel != null) setDrag({ x1: e.activeLabel, x2: e.activeLabel }) },
+    onMouseMove: (e) => { if (drag && e?.activeLabel != null) setDrag(d => ({ ...d, x2: e.activeLabel })) },
+    onMouseUp:   ()  => { if (drag && drag.x1 !== drag.x2) setZoom(drag); setDrag(null) },
+    onMouseLeave:()  => { setDrag(null) },
+  }
+  const slice = (data, key = 'ts') => {
+    if (!zoom || !Array.isArray(data)) return null
+    const i1 = data.findIndex(r => r[key] === zoom.x1)
+    const i2 = data.findIndex(r => r[key] === zoom.x2)
+    if (i1 < 0 || i2 < 0) return null
+    const [a, b] = i1 <= i2 ? [i1, i2] : [i2, i1]
+    return data.slice(a, b + 1)
+  }
+  return { drag, zoom, handlers, slice, reset: () => setZoom(null) }
+}
