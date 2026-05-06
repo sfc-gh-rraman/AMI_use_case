@@ -15,7 +15,13 @@ This document is the detailed design for a Snowflake-native Advanced Metering In
 4. **AMI 2.0 Observability & SLA Dashboard**
 5. **(Extension) Real-time Anomaly Detection on AMI Intervals**
 
-The platform is **data-engineering-first and infrastructure-heavy**. A realistic 100K-meter / 1-year dataset (~3.5B interval rows) is synthesized directly inside Snowflake and runs through a full production-style pattern: Snowpipe Streaming, VARIANT landing, Dynamic Table chains with MERGE semantics, Data Metric Functions with anomaly detection, row-access policies, secure views, and Cortex ML for anomaly scoring. A React single-page application served from Snowpark Container Services provides the operator-facing dashboard.
+The platform is **data-engineering-first and infrastructure-heavy**. A realistic 100K-meter / 1-year dataset (~3.5B interval rows; 10.6B after channel-keying) is synthesized directly inside Snowflake and runs through a full production-style pattern: Snowpipe Streaming, VARIANT landing, Dynamic Table chains with MERGE semantics, Data Metric Functions with anomaly detection, row-access policies, secure views, and Cortex ML for anomaly scoring (per-feeder + per-meter).
+
+A React single-page application — served from Snowpark Container Services in production and runnable locally for dev — provides the operator-facing console. The console covers ten tabs: Ingestion, Data Quality, Billing, TOU Charges, Transformers, Map, Events, Anomalies, Observability, and Intelligence (a Cortex Agent chat surface that can answer questions over the semantic view, search the runbook knowledge base, and render Vega-Lite charts inline).
+
+The Anomaly tab in particular is the flagship narrative: model cards expose what each Cortex ML model knows, a forecast-band chart layers actual on forecast on a 95% prediction band with anomaly points highlighted, the top-15 ranked anomaly tables drill into a side panel with `$` exposure, and a per-transformer rollup attributes feeder-level anomalous excess down to specific transformers. See §13 and §16 for the full as-built description.
+
+A tariff layer (proper SCD2 customer→schedule mapping, component-level charge model from URDB, value-at-risk dispatch DT) is documented as plan-of-record in §15 but **deferred** as a future build. Until it ships, all `$` figures in the console use a flat placeholder rate (`$0.15/kWh`) with an explicit caption.
 
 ---
 
@@ -642,15 +648,80 @@ Each test is its own SQL file under `/test/`.
 
 Two consumption surfaces are exposed on top of `AMI_MART` and `AMI_OBSERVABILITY`:
 
-### 13.1 React dashboard on Snowpark Container Services
+### 13.1 React dashboard — Operations Console
 
-A Vite + React single-page app with an Express backend is packaged as a Docker image and deployed as an SPCS service (`AMI_DASHBOARD_SVC`). Inside the container the backend authenticates to Snowflake via the OAuth token mounted at `/snowflake/session/token`, queries run through `AMI_QUERY_WH`, and results are cached in-process with 60–600 s TTLs.
+A Vite + React single-page app (`dashboard-app/`) with an Express backend is packaged as a Docker image and deployed as an SPCS service (`AMI_DASHBOARD_SVC`). Locally it runs on port 5173 (frontend) + 8080 (backend) for development.
 
-The UI renders five tabs — Ingestion, Data Quality, Billing, TOU Charges, Anomalies — each composed of KPIs, line / bar / area charts, and ranked tables backed by dedicated `/api/*` endpoints.
+**Auth.** In SPCS the backend authenticates to Snowflake via the OAuth token mounted at `/snowflake/session/token`. Locally the same code path falls back to PAT via `SNOWFLAKE_PAT` / `SNOWFLAKE_PASSWORD`.
+
+**Caching.** Every endpoint is wrapped in `cached(key, ttl_seconds, fn)` with TTLs of 60–600 s based on data volatility. Hot endpoints (KPIs) are 60 s; rollup tables (transformer load, anomaly summaries) are 300–600 s. Two queries on the same tab generally hit cache.
+
+**Tabs (10).** Ingestion · Data Quality · Billing · TOU Charges · Transformers · Map · Events · Anomalies · Observability · Intelligence.
+
+**Visual system.** Navy/atlas dark theme, JetBrains Mono / Space Grotesk fonts, Lucide icons, Recharts + Vega-Lite for visualisation, Leaflet (Carto dark tiles) for maps. Sidebar collapses; status footer shows live row counts (`100K meters · 10.6B intervals`).
+
+#### 13.1.1 Anomaly tab — flagship narrative
+
+The Anomaly tab carries the bulk of the "make Cortex ML legible" narrative.
+
+- **KPIs:** rows scored, feeder anomalies, per-meter anomalies, top-15 dollar exposure
+- **Two model cards** (`/api/anomaly/model-card`): for each of `ami_feeder_anom_model` and `ami_cni_meter_anom_model` we show series count, training-window days, training rows, last-trained timestamp, scored count, anomalies found (count and %), and the σ-distance distribution (avg / max). This makes the Cortex ML training context visible to a non-data-scientist audience
+- **Forecast band chart** (`/api/anomaly/forecast/:feeder_id`): a Recharts `ComposedChart` showing — over the last 168 hours for the top-anomaly feeder — actual kWh (solid blue line) on top of the model's forecast (dashed purple) on top of the 95% prediction band (shaded), with anomaly hours highlighted as red scatter points. Anomaly hover surfaces the σ-distance score.
+- **Top-15 feeder anomalies table:** ranked by σ-distance with $-exposure column. Every row is clickable.
+- **Per-transformer rollup of feeder anomalies** (`/api/anomaly/by-transformer`): proportional allocation of feeder excess kWh down to the transformer grain. For each feeder anomaly hour, the excess `(actual − forecast)` is allocated to the feeder's transformers in proportion to their 30-day share of feeder load. Output: top 25 transformers ranked by estimated `$` exposure during anomaly windows. Each row carries `kVA`, `meters`, `feeder_anomaly_hours`, `share_pct`, `est_excess_kwh`, `$_exposure`, `max_σ`. Click → opens the parent feeder's drill-down. (See §16.4 for the why and the trade-off vs full transformer-grain scoring.)
+- **Top-15 per-meter anomalies table** (CNI sample) with $-exposure column.
+- **Drill-down side panel** (slide-in from right): activated by clicking any row. Shows actual kWh, forecast, upper bound, σ-distance, estimated $ exposure for that hour, and the parent feeder's forecast band chart inline. Closes via X.
+- **Injected-anomaly ground-truth panel:** for model validation — 50 theft meters, 30 dead meters, 20 voltage-sag meters, with windows.
+
+#### 13.1.2 Intelligence tab — Snowflake Intelligence in the dashboard
+
+A streaming chat surface that talks to a Cortex Agent (`AMI_DEMO.AMI_MART.AMI_INTELLIGENCE_AGENT`) configured with three tools:
+
+| Tool | Purpose | Backing object |
+|---|---|---|
+| `ami_analyst` | Quantitative text-to-SQL | semantic view `AMI_MART.AMI_SEMANTIC_VIEW`, `execution_environment.warehouse=AMI_QUERY_WH` |
+| `search_kb` | Runbook / definitional | Cortex Search service `AMI_ML.AMI_KB_SEARCH` |
+| `to_chart` | Vega-Lite chart spec generation | Built-in `data_to_chart` |
+
+**SSE streaming pipeline.** `/api/intelligence/stream` proxies Snowflake's named-event SSE format (`event: response.text.delta\ndata: {…}`) into a flat `{type,content}` stream the React client can consume. The parser handles:
+- `response.tool_use` → emits `status` with tool name + icon
+- `response.tool_result` → inspects `content[].json` for `sql`, `searchResults`, or `charts` (data_to_chart returns charts as an array of JSON-encoded Vega-Lite strings — parser must `JSON.parse` each)
+- `response.text.delta` → progressive `text` deltas
+- `response.thinking.delta` → swallowed (would be too noisy)
+
+**Inline chart rendering.** When the agent calls `data_to_chart`, the spec is forwarded to the client and rendered inline below the answer using `vega-embed` with a dark-theme overlay. A small **CHART** label sits above the SVG. The same agent message can carry text + SQL + table + chart simultaneously.
+
+**Thinking panel.** A collapsible step-by-step trace (Routing → Choosing tool → Cortex Analyst → Reviewing → data_to_chart → Reviewing → final text) auto-expands while busy and collapses on completion.
+
+#### 13.1.3 Other tabs
+
+- **Map** (`/api/map/feeders`): Leaflet with Carto dark-all tiles, ~2 000 feeder markers coloured by health and clustered. Marker popup shows feeder ID, transformer count, meter count, on-time %, anomaly count.
+- **Transformers**: 30d load-factor leaderboard, per-territory transformer-count breakdown, KVA-vs-load scatter
+- **Ingestion / Data Quality / Billing / TOU Charges / Events / Observability**: per-domain KPIs, time-series, ranked tables (the original five tabs from the early build, hardened)
+
+#### 13.1.4 Dollar overlays (placeholder)
+
+KPI cards on Ingestion, Billing, Anomalies, and the per-transformer rollup carry `$` values computed at a flat placeholder rate (`RATE_PER_KWH = $0.15`) with population averages (`AVG_KWH_PER_INTERVAL = 2.0`, `AVG_KWH_PER_BILL = 750`). Each card carries a "@ $0.15/kWh placeholder" caption. These swap out for tariff-resolved rates if/when §15 is built.
+
+| Tab | Dollar overlay | Formula |
+|---|---|---|
+| Ingestion | $ exposure (1d, est.) | `late_arrivals_1d × 2 kWh × $0.15` |
+| Billing | $ in held bills (est.) | `not_ready_count × 750 kWh × $0.15` |
+| Anomalies | $ exposure (top 15, est.) | `Σ max(0, actual − forecast) × $0.15` over top-15 anomalies |
+| Anomalies (drill) | Hour exposure | `(actual − forecast) × $0.15` for the clicked hour |
+| Anomalies (xfm rollup) | $ exposure per transformer | `share × feeder_excess_kwh × $0.15` |
 
 ### 13.2 Cortex Analyst semantic view
 
-`AMI_MART.AMI_SEMANTIC_VIEW` is the business-facing semantic layer. It publishes seven tables (`daily_rollup`, `billing`, `charge_line`, `anomalies`, `meter`, `service_point`, `sla`), their relationships, curated facts and dimensions (territory, feeder, meter type, premise type, TOU bucket, rate plan, season), and a set of metrics (total kWh, billed kWh, billing-ready %, total energy / demand charge, anomaly count, average on-time %). Downstream Cortex Analyst and Agent endpoints can query it directly with natural language.
+`AMI_MART.AMI_SEMANTIC_VIEW` is the business-facing semantic layer feeding `ami_analyst`. It publishes seven tables (`daily_rollup`, `billing`, `charge_line`, `anomalies`, `meter`, `service_point`, `sla`), their relationships, curated facts and dimensions (territory, feeder, meter type, premise type, TOU bucket, rate plan, season), and a metric set (total kWh, billed kWh, billing-ready %, total energy / demand charge, anomaly count, average on-time %).
+
+### 13.3 Cortex Search service
+
+`AMI_ML.AMI_KB_SEARCH` over `AMI_KNOWLEDGE_BASE` (10 documents covering outage runbook, tariff overview, billing readiness rules, anomaly playbook, SLA definitions, etc.) feeds the `search_kb` agent tool.
+
+### 13.4 Cortex Agent
+
+`AMI_MART.AMI_INTELLIGENCE_AGENT` orchestrates the three tools above with `models.orchestration=auto`. The instructions explicitly instruct the agent to use Cortex Analyst for quantitative questions, Cortex Search for qualitative, and to invoke `data_to_chart` after Analyst returns rows for any chartable question.
 
 ---
 
@@ -706,16 +777,20 @@ TOU pricing is typically applied to a specific channel set — usually the deliv
 VEE runs per-channel, not per-meter. A meter might have a valid kWh channel but a failed voltage channel in the same interval.
 Billing aggregates specific channels (SUM of delivered-kWh, MAX of demand-kW) over the billing period.
 
-
-To-Dos:
-1. Channels 2. Gaps 3. Dashboard view - add transformers, drill down by time period, events, dollar value, geographical view (add equipment view + maps), observability tabs 4. Snowflake Intelligence - build the semantic view, build the agents and search and embed the dashboard view.
+> **Status — channel-keyed model is built.** The platform shipped with a physical
+> channel-keyed fact `INTERVAL_READ_CHANNEL` (10.59B rows after backfill), a
+> `METER_CHANNEL` dim (303K rows) and `CHANNEL_CATALOG` (11 entries, 4 active:
+> `KWH_DEL`, `KWH_REC`, `KW_DEM`, `VOLT_AVG`). A backward-compat view
+> `V_INTERVAL_READ_15MIN_WIDE` keeps the pre-pivoted shape for downstream
+> consumers that haven't migrated yet.
 
 ---
 
 ## 15. Tariff Model & Operational Value-at-Risk
 
-> **Status:** Plan of record. Ready to build once Section 16 (frontend
-> enhancements) is approved.
+> **Status: Deferred.** Significant build (≈2.5 days). Captured here as
+> plan-of-record so it can be picked up whole. Until it lands, dollar overlays
+> in the dashboard use a flat placeholder rate (`$0.15/kWh`) — see §16.4.
 
 ### 15.1 The problem we are solving
 
@@ -991,66 +1066,144 @@ test/
 
 ---
 
-## 16. Frontend Enhancements (To Discuss)
+## 16. Frontend & Operations Console — As Built
 
-> **Status:** Discussion list. Build order TBD.
+> **Status:** Shipped (local dev). SPCS redeploy pending an
+> `EXTERNAL_NETWORK_ACCESS_RULE` for `*.basemaps.cartocdn.com`.
 
-The current dashboard is a faithful operations console: 10 tabs, KPIs, charts, tables, map, agent chat. The reference app (`construction_capital_delivery`) is more *narrative*. To bring AMI to that level, the candidates below are organised by "what changes in the user's day".
+This section captures the frontend in its current built form. The stack and the
+tab inventory live in §13.1; this section documents the patterns that make the
+console more than a static dashboard, and the dollar / model-insight overlays
+that we built **without** waiting for the tariff layer (§15).
 
-### 16.1 ML model insights — make the anomaly model legible
+### 16.1 ML model insights — making Cortex ML legible
 
-Today the Anomaly tab shows top-N rows and a distance score. What the reference app does well is **explain the model in business terms**.
+Three patterns on the Anomaly tab make the trained models visible:
 
-- **Model card panel** — accuracy, precision/recall on injected anomalies, time-to-detect distribution, last-trained timestamp, training-data window. Pulled live from the model's evaluation history.
-- **Forecast band visualisation** — for any meter or feeder, plot last 7 days of `KWH_DELIVERED` with the model's forecast and `[LOWER_BOUND, UPPER_BOUND]` shaded. Anomaly points are highlighted with the distance score on hover. This is the single most powerful chart for showing how Cortex ML works.
-- **Drift indicator** — a small chart of the model's average prediction error per day; if drift exceeds a threshold, surface a "retrain recommended" callout.
-- **Per-anomaly explainer** — clicking a row in the top-N table opens a side panel with: the forecast band chart for that meter ±48h, recent `METER_EVENT` rows on the same meter, the meter's `TARIFF_SCHEDULE_ID`, and the **dollar value at risk** for the anomaly window.
+- **Model cards** (`/api/anomaly/model-card`) — for both `ami_feeder_anom_model` and `ami_cni_meter_anom_model`, render: series count, training rows, training-window days, last-trained date, scored count, anomalies found (count + %), σ-distance distribution (avg / max). This is the "what does the model know" panel.
+- **Forecast band chart** (`/api/anomaly/forecast/:feeder_id`) — Recharts `ComposedChart` with three layers stacked over time:
+  - shaded band between `LOWER_BOUND` and `UPPER_BOUND` (`Area` mark, 10% opacity)
+  - dashed forecast line (purple)
+  - solid actual kWh line (blue)
+  - red `Scatter` overlay for hours where `IS_ANOMALY=TRUE`
 
-Backend changes required: `/api/anomaly/forecast/:feeder_id` (returns 7d series + forecast/bounds), `/api/anomaly/model-card`, `/api/anomaly/drift`.
+  The chart is the single most powerful artifact for explaining how Cortex ML works to a non-data-science audience.
+- **Drill-down side panel** — click any row in the Top-15 feeder anomalies or the per-transformer rollup → a slide-in panel shows actual / forecast / upper bound / σ-distance / estimated $ exposure, plus the parent feeder's forecast band chart inline. Closes with X.
 
-### 16.2 Dollar values everywhere — once §15 lands
+### 16.2 Per-transformer rollup of feeder anomalies
 
-The tariff layer makes every operational view economic. Practical surface changes:
+`/api/anomaly/by-transformer` allocates feeder excess kWh down to the transformer grain in proportion to load share, *without* training a separate transformer-level model:
 
-- **Ops Queue tab** (new, replaces or supplements Anomalies): ranked open issues with `VAR_CUMULATIVE`, customer class, regulatory flags, action button. This is the headline new tab.
-- **Revenue impact KPIs** on existing tabs:
-  - Ingestion → "$ exposed by late arrivals (last 24h)"
-  - DQ → "$ at billing risk from sustained estimation"
-  - Anomalies → "$ flagged as anomalous load (last 7d)"
-  - Transformers → "$ throughput per transformer (30d)" with the most-stressed transformers also showing dollar exposure
-- **Map heat overlay** — feeder markers coloured by aggregate VAR not just completeness; a slider toggles between "Health" and "$ at Risk".
-- **Customer class lens** — toggle on Map and Anomalies to filter by tariff class (TOU-8, D-CARE, residential default, etc.) so users can see "where are my high-value problems".
+```
+For each feeder F that had any anomaly hours:
+  feeder_excess_kwh = SUM(GREATEST(actual − forecast, 0))     -- over flagged hours
+  for each transformer T under F:
+    share_T          = T.kwh_30d / F.kwh_30d                  -- 30d load share
+    est_excess_T     = share_T × feeder_excess_kwh
+    est_$_exposure_T = est_excess_T × $0.15                   -- placeholder rate
+```
 
-### 16.3 Chat that draws charts — `data_to_chart` tool
+The output table carries `kVA`, `meter_count`, `feeder_anomaly_hours`, `share_pct`, `est_excess_kwh`, `est_$_exposure`, `max_σ`, ranked by `est_$_exposure DESC LIMIT 25`. Each row is clickable → opens the parent feeder's drill-down.
 
-The reference app pipes Cortex Analyst SQL → results → **a chart spec**, then renders it inline in the chat. We can do the same with the existing `data_to_chart` Cortex tool.
+**Trade-off — call it out clearly.** This is **proportional attribution**. It does not isolate which specific transformer *caused* the feeder anomaly. The proper alternatives, both open as future work:
 
-Pipeline:
-1. After the agent returns SQL + rows, call `data_to_chart` (or use its built-in tool variant inside the Agent spec) to produce a Vega-Lite spec.
-2. Frontend renders the spec inline below the SQL table using `vega-embed` or `react-vega`.
-3. Add a small toolbar above the chart (chart-type toggle, "open in dashboard" link).
+| Path | Cost | Fidelity |
+|---|---|---|
+| **Roll up `INTERVAL_READ_CHANNEL` to `DT_TRANSFORMER_HOURLY`** and compute per-transformer deviation at each anomaly hour | small (one extra DT) | identifies actual contributors at hour grain, no model retrain |
+| **Train Cortex ML `ANOMALY_DETECTION` with `TRANSFORMER_ID` as series** | ~1 hour ML run, 20 K series | true per-transformer scoring — and we can train the same way as feeders |
 
-This turns the Intelligence tab from a Q&A surface into an **ad-hoc analytics surface** that produces shareable charts.
+For the demo today, proportional attribution is the right level: cheap, intuitive, and surfaces the right transformers in nearly all real cases (the largest-share transformer under an anomalous feeder usually IS the contributor).
 
-Backend changes: extend `/api/intelligence/stream` SSE to emit `{ type: 'chart', spec: <vega-lite> }` events.
+### 16.3 Inline chart rendering in chat — `data_to_chart`
 
-### 16.4 Other reference-app patterns worth borrowing
+The Cortex Agent (`AMI_DEMO.AMI_MART.AMI_INTELLIGENCE_AGENT`) is configured with three tools:
+`ami_analyst` (semantic-view text-to-SQL), `search_kb` (Cortex Search over knowledge base), and `to_chart` (built-in `data_to_chart`). The agent's instructions tell it to invoke `to_chart` after Analyst returns rows for any chartable question.
 
-- **Morning Brief page** — a generated daily executive summary (Cortex `COMPLETE` over the last 24h of metrics + open issues) with a "narrative + cited tiles" layout.
-- **Project / Meter / Feeder Deep-Dive page** — pick any entity (feeder by default), see its full health profile, anomalies, charges, events, related meters.
-- **Knowledge Base page** — a browsable list of the `AMI_KNOWLEDGE_BASE` entries with search, used by the agent and visible to humans.
-- **Architecture page** — the architecture diagram from the design doc rendered in the app, showing live counts on each box (real-time row counts on each DT).
-- **AlertCard component** — small card that shows the top 1–3 active alerts (SLA breach, anomaly spike, billing readiness drop) on every page, persistent.
-- **AIThinking component** — already present in our chat; could be exposed on KPI hovers ("why is this number what it is?") for any KPI card.
+**Pipeline:**
 
-### 16.5 Recommendation
+1. User asks "Plot total kWh by territory in the last month"
+2. Agent calls `ami_analyst` → SQL + rows
+3. Agent calls `data_to_chart` → returns spec under `c.json.charts[0]` as a JSON-encoded Vega-Lite string
+4. Backend SSE proxy `JSON.parse`s each entry and emits `{ type: 'chart', spec: <vega-lite> }` events
+5. Frontend renders the spec inline under the answer using a `VegaChart` component that wraps `vega-embed` with a dark-theme overlay (`background: transparent`, `range.category` set to the navy/atlas palette)
 
-The maximum-impact ordering (assuming tariffs land first):
+**One critical gotcha for the future you:** the spec lives at `c.json.charts` (an *array of strings* — each string is a JSON-encoded Vega-Lite spec). It is **not** at `c.json.spec` and not parsed by the agent. The proxy must `JSON.parse` each array entry before forwarding.
 
-1. **Ops Queue tab** (depends on §15 step B) — single biggest narrative win.
-2. **Forecast band + per-anomaly explainer** (low effort, high "wow" — makes Cortex ML visible).
-3. **`data_to_chart` in Intelligence chat** — turns the chat from useful into a publishable analyst tool.
-4. **Dollar overlays on existing tabs** — incremental, quick wins.
-5. **Morning Brief** + **Deep Dive** — bigger lift, polish-tier additions.
+**SSE event taxonomy** the proxy emits to the client:
 
-Open question for you before we start: **do we go tariffs (§15) first and then ops-queue/dollar UI, or stand up §16.1 (model insights, forecast band, chart-rendering chat) immediately so we have a richer frontend story while the tariff data work proceeds in parallel?**
+| Event | Trigger | Payload |
+|---|---|---|
+| `status` | `response.tool_use` | `{title, content, icon}` for the thinking panel |
+| `sql` | `tool_result` containing `c.json.sql` | `{sql}` |
+| `rows` | `tool_result` containing the result-set | `{rows: [...]}` |
+| `citations` | `tool_result` containing `searchResults` | `{citations: [{title, snippet}]}` |
+| `chart` | `tool_result` containing `c.json.charts[]` | `{spec: <vega-lite>}` |
+| `text` | `response.text.delta` | `{content}` (progressive deltas) |
+| `error` | `error` event | `{content}` |
+
+### 16.4 Dollar overlays (without waiting for §15)
+
+Until tariffs land we use a flat placeholder rate (`$0.15/kWh`) and population-average kWh per interval / per bill. Every `$` figure carries an explicit `@ $0.15/kWh placeholder` caption so it's never misread as authoritative. The full overlay matrix is in §13.1.4. Replacement plan when §15 ships: every `RATE_PER_KWH * kwh` expression becomes a SCD2-resolved `tariff_resolved_rate(meter, ts) * kwh` lookup, no UI change required beyond removing the caption.
+
+### 16.5 Local-first development workflow
+
+The dashboard runs end-to-end locally before any SPCS push:
+
+```
+# in dashboard-app/
+npm run dev                          # vite on :5173 with /api → :8080 proxy
+PORT=8080 SNOWFLAKE_PAT=...          # express backend on :8080
+  SNOWFLAKE_ACCOUNT=... node server/index.js
+```
+
+PAT auth replaces SPCS OAuth-token mount. The same `connection.js` logic detects which is present and uses it. This decouples UI iteration from container build/push cycles (~30s vs ~5m).
+
+### 16.6 Reference-app patterns — deferred
+
+These are documented for future sessions. Each is a discrete, additive lift:
+
+- **Morning Brief page** — generated daily executive summary (Cortex `COMPLETE` over last 24 h of metrics + open issues) in a "narrative + cited tiles" layout
+- **Meter / Feeder / Transformer Deep-Dive page** — pick any entity, see its full health profile in one place: anomalies, charges, events, related meters, forecast band, $ exposure
+- **Knowledge Base browser** — list `AMI_KNOWLEDGE_BASE` entries with search, the same surface the agent uses
+- **Live Architecture page** — the design-doc architecture diagram rendered in the app with live row counts on each DT box
+- **Persistent AlertCard** — top 1–3 active alerts (SLA breach, anomaly spike, billing-readiness drop) shown on every page
+- **Customer-class lens** — once §15 lands, a Map / Anomalies toggle that filters by tariff class
+- **Map heat overlay** — feeder markers coloured by aggregate $ value-at-risk, with a slider that toggles between "Health" and "$ at Risk"
+- **AIThinking on KPI hover** — exposes the agent's reasoning/explanation for any KPI card on demand
+
+### 16.7 What's NOT shipped (cross-reference)
+
+| Feature | Section | Why deferred |
+|---|---|---|
+| Tariff model + Value-at-Risk DT + Ops Queue tab | §15 | Significant build work (≈2.5 days) — left as plan-of-record |
+| Per-transformer Cortex ML scoring | §16.2 trade-off | Proportional attribution is sufficient for current narrative |
+| Drift indicator | §16.1 | Single-period scoring data — drift over time pending more model runs |
+| Map heat overlay by $-VAR | §16.6 | Depends on §15 |
+| Customer-class lens | §16.6 | Depends on §15 |
+| SPCS redeploy of polished UI | — | Awaiting `EXTERNAL_NETWORK_ACCESS_RULE` for Carto tile CDN |
+
+### 16.8 Repo layout (frontend)
+
+```
+dashboard-app/
+  server/
+    index.js                         Express + SSE proxy + cache + 30+ /api/* endpoints
+    connection.js                    OAuth-token (SPCS) / PAT (local) detection
+  src/
+    components/
+      Chat.jsx                       Streaming chat with thinking panel + inline VegaChart
+      VegaChart.jsx                  vega-embed wrapper with dark theme
+      Layout.jsx                     Sidebar + top bar + status footer
+      UI.jsx                         KpiCard, Panel, Empty, Loading primitives
+      api.js                         Frontend fetch helper, fmt(), TERR_COLOR
+    pages/
+      Anomaly.jsx                    Forecast band, model cards, drill-down, transformer rollup
+      Map.jsx                        Leaflet + Carto dark feeder map
+      Transformers.jsx               Load-factor leaderboard
+      Ingestion.jsx, DataQuality.jsx, Billing.jsx, TOU.jsx, Events.jsx, Observability.jsx, Intelligence.jsx
+    main.jsx, App.jsx, index.css     Routing, theme, root
+  service-spec.yaml                  SPCS service spec
+  Dockerfile                         node:20-slim
+  tailwind.config.js                 Navy/atlas tokens, JetBrains Mono / Space Grotesk
+  vite.config.js                     /api → :8080 proxy
+```
