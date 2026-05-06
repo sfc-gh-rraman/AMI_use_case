@@ -11,12 +11,14 @@ import Events from './pages/Events'
 import Anomaly from './pages/Anomaly'
 import Observability from './pages/Observability'
 import Intelligence from './pages/Intelligence'
+import Architecture from './pages/Architecture'
 
 const PAGES = {
   home: Landing,
   ingestion: Ingestion, dq: DataQuality, billing: Billing, tou: TOU,
   transformers: Transformers, map: MapPage, events: Events,
   anomaly: Anomaly, observability: Observability, intelligence: Intelligence,
+  architecture: Architecture,
 }
 
 export default function App() {

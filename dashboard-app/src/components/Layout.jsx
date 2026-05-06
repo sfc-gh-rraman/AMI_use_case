@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import {
   Activity, Database, ShieldCheck, Receipt, Calculator, Cpu,
-  AlertTriangle, MapPin, Bell, Wrench, Sparkles, Home,
+  AlertTriangle, MapPin, Bell, Wrench, Sparkles, Home, Zap,
   ChevronLeft, ChevronRight
 } from 'lucide-react'
 
@@ -17,6 +17,7 @@ const NAV = [
   { id: 'anomaly',       label: 'Anomalies',     icon: AlertTriangle },
   { id: 'observability', label: 'Observability', icon: Wrench },
   { id: 'intelligence',  label: 'Intelligence',  icon: Sparkles },
+  { id: 'architecture',  label: 'Architecture',  icon: Zap },
 ]
 
 export default function Layout({ currentPage, onNavigate, children }) {
