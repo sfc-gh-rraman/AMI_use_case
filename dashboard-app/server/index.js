@@ -197,6 +197,34 @@ app.get('/api/billing/stats', async (_req, res) => {
   } catch (e) { console.error('billing_stats', e); res.status(500).json({ error: e.message }); }
 });
 
+// --- Billing readiness trend (monthly % ready + $ exposure) ---------------
+app.get('/api/billing/readiness-trend', async (_req, res) => {
+  try {
+    const data = await cached('billing_trend', 600, async () => {
+      const rows = await runQuery(`
+        SELECT
+          TO_VARCHAR(START_DATE,'YYYY-MM')                                          AS PERIOD,
+          COUNT(*)                                                                  AS TOTAL,
+          COUNT_IF(IS_BILLING_READY)                                                AS READY,
+          COUNT_IF(NOT IS_BILLING_READY)                                            AS NOT_READY,
+          ROUND(COUNT_IF(IS_BILLING_READY) / COUNT(*) * 100, 2)                     AS PCT_READY,
+          ROUND(COUNT_IF(NOT IS_BILLING_READY) * 750 * 0.15 / 1e6, 2)               AS DOLLARS_HELD_M
+        FROM AMI_DEMO.AMI_MART.DT_BILLING_PERIOD_CONSUMPTION
+        GROUP BY 1 ORDER BY 1
+      `);
+      return rows.map(r => ({
+        period:           r.PERIOD,
+        total:            Number(r.TOTAL),
+        ready:            Number(r.READY),
+        not_ready:        Number(r.NOT_READY),
+        pct_ready:        Number(r.PCT_READY),
+        dollars_held_m:   Number(r.DOLLARS_HELD_M),
+      }));
+    });
+    res.json(data);
+  } catch (e) { console.error('billing_trend', e); res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/billing/by-period', async (_req, res) => {
   try {
     const data = await cached('billing_by_period', 600, async () => {
