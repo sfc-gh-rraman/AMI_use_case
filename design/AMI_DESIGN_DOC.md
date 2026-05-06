@@ -712,88 +712,345 @@ To-Dos:
 
 ---
 
-## 15. Future Enhancement — Tariff Model & Operational Value-at-Risk
+## 15. Tariff Model & Operational Value-at-Risk
 
-### 15.1 The gap in the current model
-The platform today uses **TOU as a proxy for the full tariff**. The chain is `CUSTOMER.RATE_PLAN_ID → TOU_RATE_PLAN → TOU_RATE_WINDOW`, and only three rate plans are provisioned (`RP-FLAT`, `RP-TOU3`, `RP-CPP`). Two simplifications need to be addressed before the model is faithful to a real IOU:
+> **Status:** Plan of record. Ready to build once Section 16 (frontend
+> enhancements) is approved.
 
-- **Mapping is static.** `CUSTOMER.RATE_PLAN_ID` is a plain foreign key. In production a customer can move between schedules over time — TOU enrolment, rooftop-solar interconnection (NEM 2.0 vs 3.0), CARE / FERA discount qualification, default schedule changes. The mapping must be **SCD2**.
-- **Tariff ≠ TOU.** A real tariff carries fixed monthly customer charges, tiered (block) energy pricing layered on top of TOU, season schedules, facility / minimum demand charges, non-bypassable surcharges and riders, voltage-level discounts for C&I, and DER-specific export rates. A `TOU_RATE_WINDOW` row captures only the energy and demand $/unit by time band.
+### 15.1 The problem we are solving
 
-### 15.2 Proposed model
+Two production-grade gaps in the current model:
 
-```
-TARIFF_SCHEDULE                        -- e.g. "SCE TOU-D-PRIME", "GS-1", "TOU-8"
-  SCHEDULE_ID (PK)
-  NAME, EFFECTIVE_FROM, EFFECTIVE_TO
-  CUSTOMER_CLASS                       -- DOMESTIC | GS | TOU_GS | TOU_D | AGRI | EV | ...
-  VOLTAGE_LEVEL                        -- SECONDARY | PRIMARY | SUB_TRANS
-  FIXED_CHARGE_MONTHLY, MIN_BILL
-  SEASON_RULE                          -- summer / winter month list
+1. **TOU is being used as a proxy for the full tariff.** `CUSTOMER.RATE_PLAN_ID` is a single FK to a `TOU_RATE_PLAN`, and only three plans are provisioned (`RP-FLAT`, `RP-TOU3`, `RP-CPP`). A real IOU tariff carries fixed customer charges, tiered (block) energy on top of TOU, season schedules, facility / minimum demand charges, non-bypassable surcharges and riders, voltage-level discounts, and DER-specific export rates.
+2. **Customer→tariff is a static FK.** In production the assignment is **slowly-changing** — TOU enrolment, NEM 2.0 → 3.0 migration on solar install, CARE / FERA enrolment, default schedule changes, mid-cycle moves. We cannot answer *"what was this meter's tariff on April 14"* today.
 
-TARIFF_COMPONENT                       -- the building blocks of a schedule
-  COMPONENT_ID (PK)
-  SCHEDULE_ID (FK)
-  COMPONENT_TYPE                       -- ENERGY | DEMAND | FIXED | RIDER | EXPORT_CREDIT | DEMAND_FACILITY
-  TOU_BUCKET                           -- ON_PEAK | OFF_PEAK | SHOULDER | CRITICAL (nullable)
-  DAY_TYPE, SEASON, START_TIME, END_TIME
-  TIER_FROM_KWH, TIER_TO_KWH           -- for block pricing
-  RATE, UNIT                           -- $/kWh, $/kW, $/month
+The downstream business consequence: every operational decision that should be **economic** (which truck rolls first, which billing period gets manual review first, which estimation backlog gets addressed first) is currently made on FIFO or proximity. That is the lever this section unlocks.
 
-CUSTOMER_TARIFF_ASSIGNMENT             -- SCD2: who's on what, when
-  CUSTOMER_ID
-  SCHEDULE_ID
-  EFFECTIVE_FROM, EFFECTIVE_TO, IS_CURRENT
-  ENROLLMENT_REASON                    -- DEFAULT | OPT_IN | MOVE_IN | SOLAR_INSTALL | CARE
-```
+### 15.2 Logical model
 
-`DT_INTERVAL_CHARGE_LINE` becomes `DT_INTERVAL_CHARGE_COMPONENT` — one row per (interval × resolved tariff component). Energy components multiply kWh × rate by TOU bucket and tier; demand components contribute to a demand-window MAX that gets multiplied later; fixed and rider components allocate per interval; export credit applies only to `KWH_REC` channel.
-
-### 15.3 Source of truth for real rates
-- **OpenEI U.S. Utility Rate Database (URDB)** — NREL-maintained JSON API, covers most US IOUs including SCE. Maps cleanly to `TARIFF_COMPONENT`. Practical demo starting point.
-- **SCE Tariff Books** (`sce.com/regulatory/tariff-books`) — authoritative PDFs, good for spot-checking URDB.
-- **CPUC Advice Letters** — pending rate changes for change-over-time scenarios.
-
-For demo, pull 6–10 representative SCE schedules from URDB: `D` (residential), `D-CARE`, `TOU-D-PRIME`, `TOU-D-4-9PM`, `GS-1`, `TOU-GS-1-E`, `TOU-GS-3`, `TOU-8` (large C&I), `AG-TOU`. Map to the synthetic customer mix.
-
-### 15.4 The operational story — Value-at-Risk dispatch
-
-Once tariffs are modelled, the platform answers the question that FIFO dispatch can't: **what is the $/hour exposure of every open service issue, and which one should the truck go to first?**
+#### Reference / dimension layer
 
 ```
-value_at_risk_per_hour(meter, t) =
-    forecast_kwh_next_hour(meter, t)        × energy_rate_effective(meter, t)
-  + forecast_peak_kw(meter, t)              × demand_rate(meter, t)
-                                            × demand_window_exposure_factor
-  + lost_export_credit(meter, t)            if HAS_DER
-  + regulatory_penalty_if_applicable(meter, issue_type)
+TARIFF_SCHEDULE                          Schedule-level header (one row per published rate)
+  SCHEDULE_ID         VARCHAR PK         e.g. SCE-TOU-D-PRIME-2025
+  UTILITY_CODE        VARCHAR            SCE | PGE | SDGE | ...
+  NAME                VARCHAR            "Time-of-Use, Domestic, Prime Time"
+  CUSTOMER_CLASS      VARCHAR            DOMESTIC | GS | TOU_GS | TOU_LARGE | AGRI | EV | STREET_LIGHTING
+  VOLTAGE_LEVEL       VARCHAR            SECONDARY | PRIMARY | SUB_TRANS
+  IS_DEFAULT          BOOLEAN            default schedule for that customer class
+  IS_CARE             BOOLEAN            CARE / FERA discount schedule
+  NEM_VERSION         VARCHAR            NULL | NEM1 | NEM2 | NEM3
+  SEASON_RULE         VARIANT            JSON { "summer_months":[6,7,8,9], "winter_months":[12,1,2] }
+  FIXED_CHARGE_MONTHLY NUMBER(8,2)       e.g. 10.00
+  MIN_BILL_MONTHLY    NUMBER(8,2)
+  EFFECTIVE_FROM      DATE
+  EFFECTIVE_TO        DATE
+  SOURCE_URL          VARCHAR            URDB id or SCE tariff-book URL for traceability
+  RAW_PAYLOAD         VARIANT            full URDB JSON payload, audit / replay
+
+
+TARIFF_COMPONENT                         Building blocks of a schedule
+  COMPONENT_ID        VARCHAR PK
+  SCHEDULE_ID         VARCHAR FK
+  COMPONENT_TYPE      VARCHAR            ENERGY | DEMAND | DEMAND_FACILITY | FIXED |
+                                         RIDER | EXPORT_CREDIT | MIN_BILL
+  TOU_BUCKET          VARCHAR            ON_PEAK | OFF_PEAK | SHOULDER | CRITICAL_PEAK | NULL
+  DAY_TYPE            VARCHAR            WEEKDAY | WEEKEND | HOLIDAY | ALL
+  SEASON              VARCHAR            SUMMER | WINTER | ALL
+  START_TIME          TIME               window start (local)
+  END_TIME            TIME               window end (local)
+  TIER_FROM_KWH       NUMBER             block pricing - from
+  TIER_TO_KWH         NUMBER             block pricing - to (NULL = unbounded)
+  RATE                NUMBER(10,5)       $/unit
+  UNIT                VARCHAR            KWH | KW | MONTH | METER_DAY | EVENT
+
+
+TARIFF_RIDER                             Account- or schedule-level adders / surcharges
+  RIDER_ID            VARCHAR PK
+  RIDER_CODE          VARCHAR            PPP | DWREC | NUCLEAR | WILDFIRE | CCA_GEN | TBSURCHG
+  DESCRIPTION         VARCHAR
+  RATE                NUMBER(10,5)
+  UNIT                VARCHAR            KWH | METER_DAY | PCT
+  APPLIES_TO          VARCHAR            ALL | DELIVERED | RECEIVED | DEMAND
+  EFFECTIVE_FROM/TO   DATE
+
+
+CUSTOMER_TARIFF_ASSIGNMENT                SCD2: who is on what schedule, when
+  ASSIGNMENT_ID       VARCHAR PK
+  CUSTOMER_ID         VARCHAR FK
+  SCHEDULE_ID         VARCHAR FK
+  EFFECTIVE_FROM      TIMESTAMP_NTZ
+  EFFECTIVE_TO        TIMESTAMP_NTZ
+  IS_CURRENT          BOOLEAN
+  ENROLLMENT_REASON   VARCHAR            DEFAULT | OPT_IN | MOVE_IN | SOLAR_INSTALL |
+                                         CARE_QUALIFY | DEFAULT_RATE_CHANGE
+  EVIDENCE_REF        VARCHAR            CIS work order / advice letter / tariff filing
 ```
 
-Materialised as a Dynamic Table:
+`TARIFF_COMPONENT` is the heart of this model. It encodes **every** way a $/unit is charged: TOU energy bands, demand $/kW, monthly fixed, riders, export credits. The interval charge calculator then becomes a deterministic many-component join — no special cases per schedule.
+
+#### Fact layer rebuild
+
+The current `DT_INTERVAL_CHARGE_LINE` becomes `DT_INTERVAL_CHARGE_COMPONENT`:
 
 ```
-DT_SERVICE_ISSUE_PRIORITY
-  ISSUE_ID, METER_ID, ISSUE_TYPE, DETECTED_AT, DURATION_HOURS,
-  TARIFF_SCHEDULE_ID, CUSTOMER_CLASS, IS_CARE, IS_MEDICAL_BASELINE,
-  VALUE_AT_RISK_HOURLY, VALUE_AT_RISK_CUMULATIVE,
-  PRIORITY_SCORE                       -- composite of $ at risk, duration, SAIDI weight, regulatory flags
+DT_INTERVAL_CHARGE_COMPONENT
+  METER_ID            VARCHAR
+  CHANNEL_CODE        VARCHAR             KWH_DEL | KWH_REC | KW_DEM
+  READ_TS             TIMESTAMP_NTZ
+  SCHEDULE_ID         VARCHAR             resolved as-of READ_TS via SCD2 join
+  COMPONENT_ID        VARCHAR
+  COMPONENT_TYPE      VARCHAR
+  TOU_BUCKET          VARCHAR
+  TIER                NUMBER              tier index when block-priced
+  QUANTITY            NUMBER(14,4)        kWh / kW / 1.0 (for fixed)
+  RATE                NUMBER(10,5)
+  CHARGE              NUMBER(14,4)        QUANTITY × RATE
 ```
 
-Inputs feed from:
-- `AMI_ANOMALY_EVENTS` and `AMI_METER_ANOMALY_EVENTS` (anomaly-driven issues)
-- `METER_EVENT` (outages, tamper, comms loss)
-- `DT_DATA_QUALITY_METRICS` (sustained estimation = revenue assurance risk)
+Resolution rules baked into the DT:
+- **Energy components**: `QUANTITY = KWH_DEL` for the matching TOU window/season; tier index is computed as a running `SUM(KWH) OVER (PARTITION BY meter, billing_period)` to pick the right block.
+- **Demand components**: `QUANTITY = KW_DEM`; the actual demand charge is at the **billing period** level — per-interval rows carry `RATE` for traceability and the rollup picks `MAX(KW_DEM × RATE)` over the demand window of the period.
+- **Fixed / Min Bill**: allocate `QUANTITY = 1.0/N_INTERVALS` so per-interval charges sum to the monthly amount.
+- **Riders**: pass through their `APPLIES_TO` filter against the channel.
+- **Export credit**: applied only to `KWH_REC` rows, with the schedule's `NEM_VERSION` selecting the right rate (NEM 2.0 retail-equivalent vs NEM 3.0 ACC).
 
-The ops console then sorts open issues by `VALUE_AT_RISK_CUMULATIVE DESC` (with a hard prioritisation override for CARE / medical-baseline customers as required by CPUC). The single dispatcher view becomes:
+A simple `V_BILLING_PERIOD_CHARGES` view summarises charges per (`BILLING_PERIOD_ID`, `COMPONENT_TYPE`) for the React dashboard.
 
-> *"1 large industrial on TOU-8, $4 200 exposure in next 4 hours"* ranked above *"12 residential on D-CARE, $180 combined"* — but with CARE/medical flags surfaced so they're never deprioritised against regulator-protected classes.
+### 15.3 Data acquisition
 
-### 15.5 Adjacent payoffs unlocked by the same model
-- **Revenue assurance** — meters flagged `ESTIMATED` for > N days on tariffs with demand charges (highest billing risk)
-- **SAIDI / SAIFI weighting** — outage minutes weighted by customer class for regulatory reporting
-- **Rate-design analytics** — true-up modelling, shadow billing for rate-change impact studies
-- **Net-metering settlement** — proper NEM 2.0 vs 3.0 export credit accounting
+**Primary source — OpenEI URDB**:
+- `https://api.openei.org/utility_rates?version=latest&format=json&detail=full&sector=Residential|Commercial&utility_id=eia/17609` (SCE EIA ID = 17609)
+- Returns ~80 SCE schedules; we'll select 10 representative ones below.
 
-### 15.6 Phasing
-- **Step A — Tariff model + SCD2 assignment.** `TARIFF_SCHEDULE` / `TARIFF_COMPONENT` / `CUSTOMER_TARIFF_ASSIGNMENT`, retrofit `DT_INTERVAL_CHARGE_LINE` into a component-aware DT, populate from URDB for ~10 SCE schedules.
-- **Step B — Value-at-risk DT + ops queue.** Build `DT_SERVICE_ISSUE_PRIORITY` and surface a "Prioritised Ops Queue" tab in the React dashboard. This is the differentiator that turns the demo from a credible reference architecture into an executive-grade story about $-weighted dispatch versus FIFO.
+**Pull / load pipeline** (idempotent, monthly cron):
+1. Python `tariff_loader.py` calls URDB API per `utility_id` and writes a single line of JSON per schedule into `@AMI_RAW.URDB_STAGE/<utility>/<date>/<schedule_id>.json`.
+2. A Snowpipe loads the stage to `AMI_RAW.URDB_RAW (RAW_PAYLOAD VARIANT, INGESTED_AT)`.
+3. A Dynamic Table `DT_TARIFF_SCHEDULE` flattens `RAW_PAYLOAD` into the canonical `TARIFF_SCHEDULE` row, normalising `energyratestructure`, `energyweekdayschedule`, `energyweekendschedule`, `demandratestructure`, `fixedchargefirstmeter`, etc., into `TARIFF_COMPONENT` rows.
+4. Schedules with `effective_to < CURRENT_DATE - 30` are kept (no purge) to support change-over-time queries.
+
+**Schedules pulled for the demo (SCE 2025 vintage)**:
+
+| Code | Class | Notes |
+|---|---|---|
+| `D` | Domestic default | Tiered, no TOU |
+| `D-CARE` | Domestic CARE | Tiered, ~32% discount, regulator-protected class |
+| `TOU-D-4-9PM` | Domestic TOU | 4–9 PM on-peak window |
+| `TOU-D-PRIME` | Domestic TOU | Whole-house TOU |
+| `GS-1` | Small commercial default | Tiered, no demand |
+| `TOU-GS-1-E` | Small commercial TOU | Energy-only TOU |
+| `TOU-GS-3-B` | Medium commercial | Demand charges |
+| `TOU-8` | Large industrial primary | Demand + demand-facility, summer/winter |
+| `AG-TOU-A` | Agricultural | Pumping load |
+| `EV-TOU-5` | Residential EV | Super-off-peak overnight |
+
+**SCD2 customer assignment seeding**:
+- 80% of customers get the default schedule for their class.
+- 20% get a non-default opt-in schedule with an `EFFECTIVE_FROM` distributed across the year (simulates rolling enrolment).
+- 3% of meters with `HAS_DER=TRUE` get a NEM-version transition during the year (NEM 2.0 → NEM 3.0) to demonstrate change-over-time charge calculation.
+- 12% (CA-realistic) on `D-CARE`, with a ~1% annual qualify/unqualify churn.
+
+### 15.4 Operational Value-at-Risk
+
+This is the executive story the tariff model unlocks.
+
+#### Definition
+
+For any open service issue *i* on meter *m* detected at *t*, with expected resolution time *t + h*:
+
+```
+VAR_per_hour(m, t) =
+  Σ over channels c ∈ {KWH_DEL, KWH_REC, KW_DEM} :
+
+    if c = KWH_DEL:
+        forecast_kwh_next_hour(m, t)
+        × resolved_energy_rate(m, t)            -- TOU bucket × tier × rider stack
+
+    if c = KWH_REC and HAS_DER(m):
+        - lost_export_credit_per_hour(m, t)     -- nem_version-aware
+
+    if c = KW_DEM:
+        forecast_peak_kw(m, t)
+        × resolved_demand_rate(m, t)
+        × demand_window_exposure_factor(t)      -- P(this hour becomes the bill peak)
+        / hours_in_billing_period
+
+  + regulatory_penalty(m, issue_type, h)        -- e.g. SAIDI minutes × class weight
+
+VAR_cumulative(m, t, h) = VAR_per_hour × h_remaining
+```
+
+`forecast_kwh_next_hour` and `forecast_peak_kw` come for free from the existing
+Cortex ML feeder/meter anomaly model (it produces forecast bands; we use the
+point forecast). `demand_window_exposure_factor` is a precomputed feeder-level
+table from history: `P(interval_t is peak | hour-of-day, day-of-week, season)`.
+
+#### Materialisation
+
+```
+DT_SERVICE_ISSUE_PRIORITY                  target_lag = 5 minutes
+  ISSUE_ID                                 stable hash of (meter, issue_type, start_ts)
+  METER_ID, CUSTOMER_ID
+  ISSUE_TYPE                               OUTAGE | TAMPER | COMMS_LOSS | ANOMALY |
+                                           SUSTAINED_ESTIMATION | VOLTAGE_SAG
+  ISSUE_SOURCE                             METER_EVENT | AMI_ANOMALY_EVENTS |
+                                           AMI_METER_ANOMALY_EVENTS | DT_DATA_QUALITY
+  DETECTED_AT                              TIMESTAMP_NTZ
+  DURATION_HOURS                           computed
+  STATUS                                   OPEN | DISPATCHED | RESOLVED | SUPPRESSED
+  TARIFF_SCHEDULE_ID                       resolved as-of DETECTED_AT
+  CUSTOMER_CLASS                           denormalised
+  IS_CARE, IS_MEDICAL_BASELINE             regulatory flags (must override $ ranking)
+  HAS_DER
+  VAR_HOURLY                               $ at risk if not resolved this hour
+  VAR_CUMULATIVE                           $ at risk through expected resolution
+  REGULATORY_FLOOR                         non-zero priority bump for protected classes
+  PRIORITY_SCORE                           composite (see below)
+```
+
+Priority composite (designed to be auditable, not magical):
+
+```
+PRIORITY_SCORE =
+    base_score(VAR_CUMULATIVE)               -- log-scale to $
+  × duration_multiplier(DURATION_HOURS)      -- 1.0 → 1.5 over 4h
+  × class_multiplier(CUSTOMER_CLASS)         -- TOU-8 = 1.0, residential = 0.7
+  + REGULATORY_FLOOR                         -- additive bump for CARE / medical / safety
+```
+
+Two ranked views drive the dashboard:
+- `V_OPS_QUEUE_BY_DOLLARS` — `ORDER BY VAR_CUMULATIVE DESC`
+- `V_OPS_QUEUE_BY_PRIORITY` — `ORDER BY PRIORITY_SCORE DESC` (the one we recommend the dispatcher use)
+
+#### Adjacent payoffs (same model, no new build)
+
+- **Revenue assurance** — `WHERE VEE_STATUS='ESTIMATED' AND days_estimated > 3 AND TARIFF_SCHEDULE.has_demand_charge` ranks billing risk.
+- **SAIDI/SAIFI weighted by class** — proper regulatory reporting weight, not "all customers equal".
+- **Rate-design analytics** — shadow billing on a proposed new schedule to size revenue impact before filing.
+- **Settlement & true-up** — NEM 2.0 vs 3.0 export crediting, CCA generation/delivery split.
+
+### 15.5 Pipeline order of operations
+
+The tariff layer plugs in **after** the canonical fact and the rollups, and **before** any consumer-facing charge view:
+
+```
+INTERVAL_READ_CHANNEL ─┐
+                       ├─► DT_INTERVAL_TOU_TAGGED      (existing - unchanged)
+TIME_DIM ──────────────┘                ▼
+                                DT_INTERVAL_CHARGE_COMPONENT   (NEW)
+                                        │
+        TARIFF_SCHEDULE ─────►──────────┤
+        TARIFF_COMPONENT ───►───────────┤
+        CUSTOMER_TARIFF_ASSIGNMENT ►────┘   (SCD2 resolved as-of READ_TS)
+                                        ▼
+                                DT_BILLING_PERIOD_CHARGES_BY_COMPONENT  (NEW)
+                                        ▼
+                  V_REVENUE_BY_SCHEDULE / V_NEM_SETTLEMENT  (consumer views)
+
+
+METER_EVENT ──┐
+ANOMALY_EVENTS─┤    DT_SERVICE_ISSUE_PRIORITY  (NEW; reads tariff + forecast)
+DQ_METRICS ────┤              ▼
+                       V_OPS_QUEUE_BY_PRIORITY  →  React dashboard "Ops Queue"
+```
+
+The existing `DT_INTERVAL_CHARGE_LINE` stays in place as a back-compat alias view over `DT_INTERVAL_CHARGE_COMPONENT` so the dashboard's TOU tab does not break.
+
+### 15.6 Validation plan
+
+| Test | What it proves |
+|---|---|
+| Sum of `DT_INTERVAL_CHARGE_COMPONENT.CHARGE` for one customer-month equals the customer's monthly bill ± $1 | The component model is bill-accurate end-to-end |
+| Switch one customer from `D` to `TOU-D-PRIME` mid-month → assignment SCD2 produces two segments with two different schedules | SCD2 mechanics are correct |
+| Force a transformer outage on 50 known meters → `DT_SERVICE_ISSUE_PRIORITY` ranks them by tariff class so the 1 industrial appears above the 49 residential | Operational story is real |
+| Mark one meter as CARE → it is never deprioritised below a non-CARE meter on the same feeder for the same outage | Regulatory compliance is honoured |
+| Shadow-bill all customers on a hypothetical `TOU-D-NEW` → produces total revenue delta vs current schedule | Rate-design analytics works |
+
+### 15.7 Repo layout
+
+```
+sql/
+  12_tariff/
+    01_tariff_ddl.sql                 (schedule, component, rider, assignment)
+    02_urdb_loader_ddl.sql            (raw stage + DT_TARIFF_SCHEDULE flatten)
+    03_charge_component_dt.sql        (DT_INTERVAL_CHARGE_COMPONENT)
+    04_billing_period_charges_dt.sql
+    05_value_at_risk_dt.sql
+    06_ops_queue_views.sql
+ingest/
+  tariff_loader.py                    (URDB pull → stage)
+test/
+  02_tariff_validation.sql            (T10–T15 from §15.6)
+```
+
+### 15.8 Phasing
+
+- **Step A — Tariff model (1–1.5 days):** schedules, components, riders, SCD2 assignment. URDB loader pulls 10 SCE schedules. Retrofit `DT_INTERVAL_CHARGE_COMPONENT`. Bill-accuracy validation.
+- **Step B — Value-at-Risk DT + Ops Queue (~1 day):** `DT_SERVICE_ISSUE_PRIORITY`, `V_OPS_QUEUE_BY_PRIORITY`, demand-window exposure factor table, regulatory-floor logic, two pre-built shadow-billing scenarios.
+- **Step C — Frontend** (covered in §16).
+
+---
+
+## 16. Frontend Enhancements (To Discuss)
+
+> **Status:** Discussion list. Build order TBD.
+
+The current dashboard is a faithful operations console: 10 tabs, KPIs, charts, tables, map, agent chat. The reference app (`construction_capital_delivery`) is more *narrative*. To bring AMI to that level, the candidates below are organised by "what changes in the user's day".
+
+### 16.1 ML model insights — make the anomaly model legible
+
+Today the Anomaly tab shows top-N rows and a distance score. What the reference app does well is **explain the model in business terms**.
+
+- **Model card panel** — accuracy, precision/recall on injected anomalies, time-to-detect distribution, last-trained timestamp, training-data window. Pulled live from the model's evaluation history.
+- **Forecast band visualisation** — for any meter or feeder, plot last 7 days of `KWH_DELIVERED` with the model's forecast and `[LOWER_BOUND, UPPER_BOUND]` shaded. Anomaly points are highlighted with the distance score on hover. This is the single most powerful chart for showing how Cortex ML works.
+- **Drift indicator** — a small chart of the model's average prediction error per day; if drift exceeds a threshold, surface a "retrain recommended" callout.
+- **Per-anomaly explainer** — clicking a row in the top-N table opens a side panel with: the forecast band chart for that meter ±48h, recent `METER_EVENT` rows on the same meter, the meter's `TARIFF_SCHEDULE_ID`, and the **dollar value at risk** for the anomaly window.
+
+Backend changes required: `/api/anomaly/forecast/:feeder_id` (returns 7d series + forecast/bounds), `/api/anomaly/model-card`, `/api/anomaly/drift`.
+
+### 16.2 Dollar values everywhere — once §15 lands
+
+The tariff layer makes every operational view economic. Practical surface changes:
+
+- **Ops Queue tab** (new, replaces or supplements Anomalies): ranked open issues with `VAR_CUMULATIVE`, customer class, regulatory flags, action button. This is the headline new tab.
+- **Revenue impact KPIs** on existing tabs:
+  - Ingestion → "$ exposed by late arrivals (last 24h)"
+  - DQ → "$ at billing risk from sustained estimation"
+  - Anomalies → "$ flagged as anomalous load (last 7d)"
+  - Transformers → "$ throughput per transformer (30d)" with the most-stressed transformers also showing dollar exposure
+- **Map heat overlay** — feeder markers coloured by aggregate VAR not just completeness; a slider toggles between "Health" and "$ at Risk".
+- **Customer class lens** — toggle on Map and Anomalies to filter by tariff class (TOU-8, D-CARE, residential default, etc.) so users can see "where are my high-value problems".
+
+### 16.3 Chat that draws charts — `data_to_chart` tool
+
+The reference app pipes Cortex Analyst SQL → results → **a chart spec**, then renders it inline in the chat. We can do the same with the existing `data_to_chart` Cortex tool.
+
+Pipeline:
+1. After the agent returns SQL + rows, call `data_to_chart` (or use its built-in tool variant inside the Agent spec) to produce a Vega-Lite spec.
+2. Frontend renders the spec inline below the SQL table using `vega-embed` or `react-vega`.
+3. Add a small toolbar above the chart (chart-type toggle, "open in dashboard" link).
+
+This turns the Intelligence tab from a Q&A surface into an **ad-hoc analytics surface** that produces shareable charts.
+
+Backend changes: extend `/api/intelligence/stream` SSE to emit `{ type: 'chart', spec: <vega-lite> }` events.
+
+### 16.4 Other reference-app patterns worth borrowing
+
+- **Morning Brief page** — a generated daily executive summary (Cortex `COMPLETE` over the last 24h of metrics + open issues) with a "narrative + cited tiles" layout.
+- **Project / Meter / Feeder Deep-Dive page** — pick any entity (feeder by default), see its full health profile, anomalies, charges, events, related meters.
+- **Knowledge Base page** — a browsable list of the `AMI_KNOWLEDGE_BASE` entries with search, used by the agent and visible to humans.
+- **Architecture page** — the architecture diagram from the design doc rendered in the app, showing live counts on each box (real-time row counts on each DT).
+- **AlertCard component** — small card that shows the top 1–3 active alerts (SLA breach, anomaly spike, billing readiness drop) on every page, persistent.
+- **AIThinking component** — already present in our chat; could be exposed on KPI hovers ("why is this number what it is?") for any KPI card.
+
+### 16.5 Recommendation
+
+The maximum-impact ordering (assuming tariffs land first):
+
+1. **Ops Queue tab** (depends on §15 step B) — single biggest narrative win.
+2. **Forecast band + per-anomaly explainer** (low effort, high "wow" — makes Cortex ML visible).
+3. **`data_to_chart` in Intelligence chat** — turns the chat from useful into a publishable analyst tool.
+4. **Dollar overlays on existing tabs** — incremental, quick wins.
+5. **Morning Brief** + **Deep Dive** — bigger lift, polish-tier additions.
+
+Open question for you before we start: **do we go tariffs (§15) first and then ops-queue/dollar UI, or stand up §16.1 (model insights, forecast band, chart-rendering chat) immediately so we have a richer frontend story while the tariff data work proceeds in parallel?**
