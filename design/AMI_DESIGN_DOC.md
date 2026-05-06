@@ -709,3 +709,91 @@ Billing aggregates specific channels (SUM of delivered-kWh, MAX of demand-kW) ov
 
 To-Dos:
 1. Channels 2. Gaps 3. Dashboard view - add transformers, drill down by time period, events, dollar value, geographical view (add equipment view + maps), observability tabs 4. Snowflake Intelligence - build the semantic view, build the agents and search and embed the dashboard view.
+
+---
+
+## 15. Future Enhancement — Tariff Model & Operational Value-at-Risk
+
+### 15.1 The gap in the current model
+The platform today uses **TOU as a proxy for the full tariff**. The chain is `CUSTOMER.RATE_PLAN_ID → TOU_RATE_PLAN → TOU_RATE_WINDOW`, and only three rate plans are provisioned (`RP-FLAT`, `RP-TOU3`, `RP-CPP`). Two simplifications need to be addressed before the model is faithful to a real IOU:
+
+- **Mapping is static.** `CUSTOMER.RATE_PLAN_ID` is a plain foreign key. In production a customer can move between schedules over time — TOU enrolment, rooftop-solar interconnection (NEM 2.0 vs 3.0), CARE / FERA discount qualification, default schedule changes. The mapping must be **SCD2**.
+- **Tariff ≠ TOU.** A real tariff carries fixed monthly customer charges, tiered (block) energy pricing layered on top of TOU, season schedules, facility / minimum demand charges, non-bypassable surcharges and riders, voltage-level discounts for C&I, and DER-specific export rates. A `TOU_RATE_WINDOW` row captures only the energy and demand $/unit by time band.
+
+### 15.2 Proposed model
+
+```
+TARIFF_SCHEDULE                        -- e.g. "SCE TOU-D-PRIME", "GS-1", "TOU-8"
+  SCHEDULE_ID (PK)
+  NAME, EFFECTIVE_FROM, EFFECTIVE_TO
+  CUSTOMER_CLASS                       -- DOMESTIC | GS | TOU_GS | TOU_D | AGRI | EV | ...
+  VOLTAGE_LEVEL                        -- SECONDARY | PRIMARY | SUB_TRANS
+  FIXED_CHARGE_MONTHLY, MIN_BILL
+  SEASON_RULE                          -- summer / winter month list
+
+TARIFF_COMPONENT                       -- the building blocks of a schedule
+  COMPONENT_ID (PK)
+  SCHEDULE_ID (FK)
+  COMPONENT_TYPE                       -- ENERGY | DEMAND | FIXED | RIDER | EXPORT_CREDIT | DEMAND_FACILITY
+  TOU_BUCKET                           -- ON_PEAK | OFF_PEAK | SHOULDER | CRITICAL (nullable)
+  DAY_TYPE, SEASON, START_TIME, END_TIME
+  TIER_FROM_KWH, TIER_TO_KWH           -- for block pricing
+  RATE, UNIT                           -- $/kWh, $/kW, $/month
+
+CUSTOMER_TARIFF_ASSIGNMENT             -- SCD2: who's on what, when
+  CUSTOMER_ID
+  SCHEDULE_ID
+  EFFECTIVE_FROM, EFFECTIVE_TO, IS_CURRENT
+  ENROLLMENT_REASON                    -- DEFAULT | OPT_IN | MOVE_IN | SOLAR_INSTALL | CARE
+```
+
+`DT_INTERVAL_CHARGE_LINE` becomes `DT_INTERVAL_CHARGE_COMPONENT` — one row per (interval × resolved tariff component). Energy components multiply kWh × rate by TOU bucket and tier; demand components contribute to a demand-window MAX that gets multiplied later; fixed and rider components allocate per interval; export credit applies only to `KWH_REC` channel.
+
+### 15.3 Source of truth for real rates
+- **OpenEI U.S. Utility Rate Database (URDB)** — NREL-maintained JSON API, covers most US IOUs including SCE. Maps cleanly to `TARIFF_COMPONENT`. Practical demo starting point.
+- **SCE Tariff Books** (`sce.com/regulatory/tariff-books`) — authoritative PDFs, good for spot-checking URDB.
+- **CPUC Advice Letters** — pending rate changes for change-over-time scenarios.
+
+For demo, pull 6–10 representative SCE schedules from URDB: `D` (residential), `D-CARE`, `TOU-D-PRIME`, `TOU-D-4-9PM`, `GS-1`, `TOU-GS-1-E`, `TOU-GS-3`, `TOU-8` (large C&I), `AG-TOU`. Map to the synthetic customer mix.
+
+### 15.4 The operational story — Value-at-Risk dispatch
+
+Once tariffs are modelled, the platform answers the question that FIFO dispatch can't: **what is the $/hour exposure of every open service issue, and which one should the truck go to first?**
+
+```
+value_at_risk_per_hour(meter, t) =
+    forecast_kwh_next_hour(meter, t)        × energy_rate_effective(meter, t)
+  + forecast_peak_kw(meter, t)              × demand_rate(meter, t)
+                                            × demand_window_exposure_factor
+  + lost_export_credit(meter, t)            if HAS_DER
+  + regulatory_penalty_if_applicable(meter, issue_type)
+```
+
+Materialised as a Dynamic Table:
+
+```
+DT_SERVICE_ISSUE_PRIORITY
+  ISSUE_ID, METER_ID, ISSUE_TYPE, DETECTED_AT, DURATION_HOURS,
+  TARIFF_SCHEDULE_ID, CUSTOMER_CLASS, IS_CARE, IS_MEDICAL_BASELINE,
+  VALUE_AT_RISK_HOURLY, VALUE_AT_RISK_CUMULATIVE,
+  PRIORITY_SCORE                       -- composite of $ at risk, duration, SAIDI weight, regulatory flags
+```
+
+Inputs feed from:
+- `AMI_ANOMALY_EVENTS` and `AMI_METER_ANOMALY_EVENTS` (anomaly-driven issues)
+- `METER_EVENT` (outages, tamper, comms loss)
+- `DT_DATA_QUALITY_METRICS` (sustained estimation = revenue assurance risk)
+
+The ops console then sorts open issues by `VALUE_AT_RISK_CUMULATIVE DESC` (with a hard prioritisation override for CARE / medical-baseline customers as required by CPUC). The single dispatcher view becomes:
+
+> *"1 large industrial on TOU-8, $4 200 exposure in next 4 hours"* ranked above *"12 residential on D-CARE, $180 combined"* — but with CARE/medical flags surfaced so they're never deprioritised against regulator-protected classes.
+
+### 15.5 Adjacent payoffs unlocked by the same model
+- **Revenue assurance** — meters flagged `ESTIMATED` for > N days on tariffs with demand charges (highest billing risk)
+- **SAIDI / SAIFI weighting** — outage minutes weighted by customer class for regulatory reporting
+- **Rate-design analytics** — true-up modelling, shadow billing for rate-change impact studies
+- **Net-metering settlement** — proper NEM 2.0 vs 3.0 export credit accounting
+
+### 15.6 Phasing
+- **Step A — Tariff model + SCD2 assignment.** `TARIFF_SCHEDULE` / `TARIFF_COMPONENT` / `CUSTOMER_TARIFF_ASSIGNMENT`, retrofit `DT_INTERVAL_CHARGE_LINE` into a component-aware DT, populate from URDB for ~10 SCE schedules.
+- **Step B — Value-at-risk DT + ops queue.** Build `DT_SERVICE_ISSUE_PRIORITY` and surface a "Prioritised Ops Queue" tab in the React dashboard. This is the differentiator that turns the demo from a credible reference architecture into an executive-grade story about $-weighted dispatch versus FIFO.
