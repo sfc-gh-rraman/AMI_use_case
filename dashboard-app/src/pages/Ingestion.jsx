@@ -3,7 +3,7 @@ import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
   AreaChart, Area, CartesianGrid, Legend } from 'recharts'
 import { Database, Users, CheckCircle2, AlertCircle, DollarSign } from 'lucide-react'
 import { api, fmt, TERR_COLOR } from '../components/api'
-import { KpiCard, Panel, Empty } from '../components/UI'
+import { KpiCard, Panel, Empty, yPadDomain, yAbbr } from '../components/UI'
 
 // Synthetic placeholder rate until tariffs land (§15)
 const RATE_PER_KWH = 0.15
@@ -42,7 +42,7 @@ export default function Ingestion() {
             <LineChart data={series}>
               <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
               <XAxis dataKey="hr" stroke="#64748b" fontSize={10}/>
-              <YAxis stroke="#64748b" fontSize={10}/>
+              <YAxis stroke="#64748b" fontSize={10} domain={yPadDomain(0.08)} tickFormatter={yAbbr} width={42}/>
               <Tooltip contentStyle={tooltipStyle}/>
               <Legend wrapperStyle={{ fontSize: 11 }}/>
               {['NE','SE','MW','W'].map(t => <Line key={t} type="monotone" dataKey={t} stroke={TERR_COLOR[t]} dot={false} strokeWidth={1.5}/>)}

@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react'
 import {
   ComposedChart, Line, Area, Scatter, XAxis, YAxis, Tooltip,
-  ResponsiveContainer, CartesianGrid, Legend
+  ResponsiveContainer, CartesianGrid, Legend, ReferenceArea
 } from 'recharts'
-import { AlertTriangle, Activity, Zap, BookOpen, Sparkles, Brain, X, ChevronRight, Layers } from 'lucide-react'
+import { AlertTriangle, Activity, Zap, BookOpen, Sparkles, Brain, X, ChevronRight, Layers, ZoomIn } from 'lucide-react'
 import { api, fmt } from '../components/api'
-import { KpiCard, Panel, Empty, Loading } from '../components/UI'
+import { KpiCard, Panel, Empty, Loading, yPadDomain, yAbbr } from '../components/UI'
 
 const tooltipStyle = { background: '#0d1117', border: '1px solid #30363d', borderRadius: 6, fontSize: 12 }
 
@@ -63,42 +63,126 @@ function ModelCardPanel({ model, label, accent }) {
   )
 }
 
+function BandChart({ data, height = 300, label, autoFit = false }) {
+  // Render the actual chart. autoFit tightens y-axis to the actual data
+  // (used for zoomed view) so a small slice shows fluctuation.
+  const yDom = autoFit ? yPadDomain(0.05) : yPadDomain(0.06)
+  return (
+    <ResponsiveContainer width="100%" height={height}>
+      <ComposedChart data={data} margin={{ top: 8, right: 8, bottom: 0, left: 0 }}>
+        <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
+        <XAxis dataKey="ts" stroke="#64748b" fontSize={10}
+          interval={Math.max(0, Math.floor(data.length / 12))}/>
+        <YAxis stroke="#64748b" fontSize={10} domain={yDom} tickFormatter={yAbbr} width={48}/>
+        <Tooltip contentStyle={tooltipStyle}/>
+        <Legend wrapperStyle={{ fontSize: 11 }}/>
+        <Area type="monotone" dataKey="upper" stroke="none" fill="#58a6ff" fillOpacity={0.10} name="95% upper"/>
+        <Area type="monotone" dataKey="lower" stroke="none" fill="#0d1117" fillOpacity={1} name="lower mask" legendType="none"/>
+        <Line type="monotone" dataKey="forecast" stroke="#a371f7" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Forecast"/>
+        <Line type="monotone" dataKey="kwh" stroke="#58a6ff" strokeWidth={2} dot={autoFit ? { r: 2, fill: '#58a6ff' } : false} name="Actual kWh"/>
+        <Scatter dataKey="anomaly_kwh" fill="#f85149" stroke="#f85149" name="Anomaly"/>
+      </ComposedChart>
+    </ResponsiveContainer>
+  )
+}
+
 function ForecastBandChart({ feederId }) {
   const [series, setSeries] = useState(null)
+  // Drag-to-zoom: track in-progress drag and committed selection (X-range only).
+  const [drag, setDrag] = useState(null)        // { x1, x2 } during drag
+  const [zoom, setZoom] = useState(null)        // { x1, x2 } committed
   useEffect(() => {
     if (!feederId) return
-    setSeries(null)
+    setSeries(null); setDrag(null); setZoom(null)
     api(`anomaly/forecast/${feederId}`).then(d => setSeries(Array.isArray(d) ? d : []))
   }, [feederId])
   if (!feederId) return <Empty message="Select a feeder anomaly to see its forecast band"/>
   if (series === null) return <Loading/>
   if (series.length === 0) return <Empty message="No forecast data for this feeder"/>
   const anomalyPoints = series.filter(s => s.is_anomaly)
+
+  // Resolve zoom into a slice of the data array
+  const zoomedData = (() => {
+    if (!zoom) return null
+    const i1 = series.findIndex(r => r.ts === zoom.x1)
+    const i2 = series.findIndex(r => r.ts === zoom.x2)
+    if (i1 < 0 || i2 < 0) return null
+    const [a, b] = i1 <= i2 ? [i1, i2] : [i2, i1]
+    return series.slice(a, b + 1)
+  })()
+
   return (
     <div>
-      <div className="text-[11px] text-slate-400 mb-2">
+      <div className="text-[11px] text-slate-400 mb-2 flex items-center gap-3">
         <span className="font-mono text-atlas-blue">{feederId}</span>
-        <span className="ml-3 text-slate-500">Hourly kWh · forecast (dashed) · 95% band (shaded) · anomalies (red)</span>
+        <span className="text-slate-500">Hourly kWh · forecast (dashed) · 95% band (shaded) · anomalies (red)</span>
+        <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-slate-500 uppercase tracking-wider">
+          <ZoomIn size={11} className="text-atlas-cyan"/> drag to zoom
+        </span>
       </div>
-      <ResponsiveContainer width="100%" height={300}>
-        <ComposedChart data={series}>
-          <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
-          <XAxis dataKey="ts" stroke="#64748b" fontSize={10} interval={Math.floor(series.length / 12)}/>
-          <YAxis stroke="#64748b" fontSize={10}/>
-          <Tooltip contentStyle={tooltipStyle}/>
-          <Legend wrapperStyle={{ fontSize: 11 }}/>
-          {/* Upper band (transparent at start) */}
-          <Area type="monotone" dataKey="upper" stroke="none" fill="#58a6ff" fillOpacity={0.10} name="95% upper" stackId={null}/>
-          <Area type="monotone" dataKey="lower" stroke="none" fill="#0d1117" fillOpacity={1} name="lower mask" legendType="none"/>
-          <Line type="monotone" dataKey="forecast" stroke="#a371f7" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Forecast"/>
-          <Line type="monotone" dataKey="kwh" stroke="#58a6ff" strokeWidth={2} dot={false} name="Actual kWh"/>
-          <Scatter dataKey="anomaly_kwh" fill="#f85149" stroke="#f85149" name="Anomaly"/>
-        </ComposedChart>
-      </ResponsiveContainer>
-      <div className="mt-3 text-[11px] text-slate-500">
-        {anomalyPoints.length} anomaly point{anomalyPoints.length === 1 ? '' : 's'} in window.
-        Cortex ML flags hours where actual kWh fell outside the model's expected band.
+
+      {/* Default chart with drag-to-box overlay */}
+      <div className="select-none cursor-crosshair">
+        <ResponsiveContainer width="100%" height={300}>
+          <ComposedChart data={series}
+            margin={{ top: 8, right: 8, bottom: 0, left: 0 }}
+            onMouseDown={(e) => { if (e?.activeLabel) setDrag({ x1: e.activeLabel, x2: e.activeLabel }) }}
+            onMouseMove={(e) => { if (drag && e?.activeLabel) setDrag(d => ({ ...d, x2: e.activeLabel })) }}
+            onMouseUp={() => {
+              if (drag && drag.x1 !== drag.x2) setZoom(drag)
+              setDrag(null)
+            }}>
+            <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
+            <XAxis dataKey="ts" stroke="#64748b" fontSize={10}
+              interval={Math.max(0, Math.floor(series.length / 12))}/>
+            <YAxis stroke="#64748b" fontSize={10} domain={yPadDomain(0.06)} tickFormatter={yAbbr} width={48}/>
+            <Tooltip contentStyle={tooltipStyle}/>
+            <Legend wrapperStyle={{ fontSize: 11 }}/>
+            <Area type="monotone" dataKey="upper" stroke="none" fill="#58a6ff" fillOpacity={0.10} name="95% upper"/>
+            <Area type="monotone" dataKey="lower" stroke="none" fill="#0d1117" fillOpacity={1} name="lower mask" legendType="none"/>
+            <Line type="monotone" dataKey="forecast" stroke="#a371f7" strokeWidth={1.5} strokeDasharray="4 4" dot={false} name="Forecast"/>
+            <Line type="monotone" dataKey="kwh" stroke="#58a6ff" strokeWidth={2} dot={false} name="Actual kWh"/>
+            <Scatter dataKey="anomaly_kwh" fill="#f85149" stroke="#f85149" name="Anomaly"/>
+            {drag && drag.x1 !== drag.x2 && (
+              <ReferenceArea x1={drag.x1} x2={drag.x2} fill="#39c5cf" fillOpacity={0.18} stroke="#39c5cf" strokeOpacity={0.6}/>
+            )}
+            {zoom && !drag && (
+              <ReferenceArea x1={zoom.x1} x2={zoom.x2} fill="#39c5cf" fillOpacity={0.08} stroke="#39c5cf" strokeOpacity={0.4} strokeDasharray="3 3"/>
+            )}
+          </ComposedChart>
+        </ResponsiveContainer>
       </div>
+
+      <div className="mt-3 text-[11px] text-slate-500 flex items-center gap-3">
+        <span>{anomalyPoints.length} anomaly point{anomalyPoints.length === 1 ? '' : 's'} in window.
+        Cortex ML flags hours where actual kWh fell outside the model's expected band.</span>
+        {zoom && (
+          <button onClick={() => setZoom(null)}
+            className="ml-auto text-[10px] uppercase tracking-wider text-atlas-cyan
+              border border-atlas-cyan/40 hover:bg-atlas-cyan/10 px-2 py-1 rounded">
+            Reset zoom
+          </button>
+        )}
+      </div>
+
+      {/* Zoomed view */}
+      {zoomedData && zoomedData.length > 1 && (
+        <div className="mt-4 rounded-lg border border-atlas-cyan/30 bg-navy-900/40 p-3 animate-slide-in">
+          <div className="flex items-center gap-2 mb-2">
+            <ZoomIn size={12} className="text-atlas-cyan"/>
+            <span className="text-[10px] text-slate-400 uppercase tracking-wider font-medium">
+              Zoomed view
+            </span>
+            <span className="text-[11px] text-slate-500 font-mono ml-2">
+              {zoomedData[0].ts} → {zoomedData[zoomedData.length-1].ts}
+            </span>
+            <span className="text-[11px] text-slate-500 ml-2">
+              · {zoomedData.length} hours · {zoomedData.filter(r => r.is_anomaly).length} flagged
+            </span>
+          </div>
+          <BandChart data={zoomedData} height={260} autoFit/>
+        </div>
+      )}
     </div>
   )
 }

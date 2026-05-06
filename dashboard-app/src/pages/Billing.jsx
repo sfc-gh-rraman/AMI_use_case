@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts'
 import { Receipt, CheckCircle2, Percent, DollarSign } from 'lucide-react'
 import { api, fmt } from '../components/api'
-import { KpiCard, Panel, Empty } from '../components/UI'
+import { KpiCard, Panel, Empty, yAbbr } from '../components/UI'
 
 const RATE_PER_KWH = 0.15
 const AVG_KWH_PER_BILL = 750  // population avg
@@ -34,7 +34,7 @@ export default function Billing() {
             <BarChart data={periods}>
               <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
               <XAxis dataKey="start_date" stroke="#64748b" fontSize={10}/>
-              <YAxis stroke="#64748b" fontSize={10}/>
+              <YAxis stroke="#64748b" fontSize={10} tickFormatter={yAbbr} width={48}/>
               <Tooltip contentStyle={tooltipStyle}/>
               <Legend wrapperStyle={{ fontSize: 11 }}/>
               <Bar dataKey="ready" stackId="a" fill="#3fb950" name="Ready"/>

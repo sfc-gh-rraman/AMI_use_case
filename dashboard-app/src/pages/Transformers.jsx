@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend } from 'recharts'
 import { Cpu, Zap, Building2 } from 'lucide-react'
 import { api, fmt } from '../components/api'
-import { KpiCard, Panel, Empty } from '../components/UI'
+import { KpiCard, Panel, Empty, yAbbr } from '../components/UI'
 
 export default function Transformers() {
   const [summary, setSummary] = useState({})
@@ -27,7 +27,7 @@ export default function Transformers() {
             <BarChart data={byTerr}>
               <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
               <XAxis dataKey="territory" stroke="#64748b" fontSize={11}/>
-              <YAxis stroke="#64748b" fontSize={10}/>
+              <YAxis stroke="#64748b" fontSize={10} tickFormatter={yAbbr} width={42}/>
               <Tooltip contentStyle={tooltipStyle}/>
               <Legend wrapperStyle={{ fontSize: 11 }}/>
               <Bar dataKey="xfm_count" fill="#58a6ff" name="Transformers" radius={[4,4,0,0]}/>

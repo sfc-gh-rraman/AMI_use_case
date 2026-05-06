@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts'
 import { api } from '../components/api'
-import { Panel, Empty } from '../components/UI'
+import { Panel, Empty, yAbbr } from '../components/UI'
 
 const RANGES = ['1d', '7d', '30d', '90d']
 
@@ -20,7 +20,7 @@ export default function Events() {
             <BarChart data={summary}>
               <CartesianGrid stroke="#21262d" strokeDasharray="3 3"/>
               <XAxis dataKey="event_type" stroke="#64748b" fontSize={11}/>
-              <YAxis stroke="#64748b" fontSize={10}/>
+              <YAxis stroke="#64748b" fontSize={10} tickFormatter={yAbbr} width={42}/>
               <Tooltip contentStyle={tooltipStyle}/>
               <Bar dataKey="count" fill="#d29922" radius={[4,4,0,0]}/>
             </BarChart>

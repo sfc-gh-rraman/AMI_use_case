@@ -38,3 +38,24 @@ export function Loading() {
     </div>
   )
 }
+
+// Recharts helpers — tighten y-axis around the data so fluctuations are visible
+// instead of squashed against a 0-baseline. `pad` is fractional padding on each
+// side of the actual data range. Use with: <YAxis domain={yPadDomain()} ... />
+export const yPadDomain = (pad = 0.05) => [
+  (dataMin) => Math.max(0, dataMin - (Math.abs(dataMin) * pad || 1)),
+  (dataMax) => dataMax + (Math.abs(dataMax) * pad || 1),
+]
+
+// Compact tick label: 1500 → 1.5k, 2_300_000 → 2.3M, 1.2e9 → 1.2B
+export const yAbbr = (v) => {
+  if (v === null || v === undefined || isNaN(v)) return ''
+  const a = Math.abs(v)
+  const sign = v < 0 ? '-' : ''
+  if (a >= 1e9) return sign + (a/1e9).toFixed(1).replace(/\.0$/, '') + 'B'
+  if (a >= 1e6) return sign + (a/1e6).toFixed(1).replace(/\.0$/, '') + 'M'
+  if (a >= 1e3) return sign + (a/1e3).toFixed(1).replace(/\.0$/, '') + 'k'
+  if (a >= 100) return sign + a.toFixed(0)
+  if (a >= 1)   return sign + a.toFixed(1).replace(/\.0$/, '')
+  return sign + a.toFixed(2)
+}
