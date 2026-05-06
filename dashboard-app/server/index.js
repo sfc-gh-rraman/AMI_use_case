@@ -313,6 +313,106 @@ app.get('/api/anomaly/top-meters', async (_req, res) => {
   } catch (e) { console.error('anom_meters', e); res.status(500).json({ error: e.message }); }
 });
 
+// --- Forecast band per feeder (last 7d) ---------------------------------
+app.get('/api/anomaly/forecast/:feeder_id', async (req, res) => {
+  try {
+    const fid = (req.params.feeder_id || '').replace(/[^A-Z0-9-]/gi, '');
+    const data = await cached('forecast_' + fid, 300, async () => {
+      const rows = await runQuery(`
+        SELECT
+          TO_VARCHAR(TS,'MM-DD HH24:MI') AS TS,
+          KWH::NUMBER(10,2)              AS KWH,
+          FORECAST::NUMBER(10,2)         AS FORECAST,
+          LOWER_BOUND::NUMBER(10,2)      AS LOWER_BOUND,
+          UPPER_BOUND::NUMBER(10,2)      AS UPPER_BOUND,
+          IS_ANOMALY                     AS IS_ANOMALY,
+          DISTANCE::NUMBER(6,3)          AS DISTANCE
+        FROM AMI_DEMO.AMI_MART.AMI_ANOMALY_EVENTS
+        WHERE FEEDER_ID = '${fid}'
+        ORDER BY TS DESC
+        LIMIT 168
+      `);
+      return rows.reverse().map(r => ({
+        ts: r.TS,
+        kwh: Number(r.KWH),
+        forecast: Number(r.FORECAST),
+        lower: Number(r.LOWER_BOUND),
+        upper: Number(r.UPPER_BOUND),
+        is_anomaly: !!r.IS_ANOMALY,
+        distance: Number(r.DISTANCE),
+        anomaly_kwh: r.IS_ANOMALY ? Number(r.KWH) : null,
+      }));
+    });
+    res.json(data);
+  } catch (e) { console.error('forecast', e); res.status(500).json({ error: e.message }); }
+});
+
+// --- Model card -----------------------------------------------------------
+app.get('/api/anomaly/model-card', async (_req, res) => {
+  try {
+    const data = await cached('model_card', 600, async () => {
+      const [feeder] = await runQuery(`
+        SELECT
+          COUNT(*)                                                       AS SCORED,
+          COUNT_IF(IS_ANOMALY)                                            AS FOUND,
+          AVG(DISTANCE)::NUMBER(6,3)                                      AS AVG_DISTANCE,
+          MAX(DISTANCE)::NUMBER(6,3)                                      AS MAX_DISTANCE,
+          (COUNT_IF(IS_ANOMALY) / NULLIF(COUNT(*),0) * 100)::NUMBER(5,2)  AS PCT_FLAGGED
+        FROM AMI_DEMO.AMI_MART.AMI_ANOMALY_EVENTS
+      `);
+      let meter = { SCORED: 0, FOUND: 0, AVG_DISTANCE: 0, MAX_DISTANCE: 0, PCT_FLAGGED: 0 };
+      try {
+        const [m] = await runQuery(`
+          SELECT
+            COUNT(*)                                                       AS SCORED,
+            COUNT_IF(IS_ANOMALY)                                            AS FOUND,
+            AVG(DISTANCE)::NUMBER(6,3)                                      AS AVG_DISTANCE,
+            MAX(DISTANCE)::NUMBER(6,3)                                      AS MAX_DISTANCE,
+            (COUNT_IF(IS_ANOMALY) / NULLIF(COUNT(*),0) * 100)::NUMBER(5,2)  AS PCT_FLAGGED
+          FROM AMI_DEMO.AMI_MART.AMI_METER_ANOMALY_EVENTS
+        `);
+        meter = m || meter;
+      } catch (_e) {}
+      return {
+        feeder_model: {
+          name: 'ami_feeder_anom_model',
+          target: 'KWH',
+          series_col: 'FEEDER_ID',
+          training_window_days: 166,
+          training_rows: 7970000,
+          n_series: 2000,
+          last_trained: '2026-04-27',
+          scored: Number(feeder?.SCORED ?? 0),
+          anomalies_found: Number(feeder?.FOUND ?? 0),
+          pct_flagged: Number(feeder?.PCT_FLAGGED ?? 0),
+          avg_distance: Number(feeder?.AVG_DISTANCE ?? 0),
+          max_distance: Number(feeder?.MAX_DISTANCE ?? 0),
+        },
+        meter_model: {
+          name: 'ami_cni_meter_anom_model',
+          target: 'KWH',
+          series_col: 'METER_ID',
+          training_window_days: 166,
+          training_rows: 1992466,
+          n_series: 500,
+          last_trained: '2026-04-27',
+          scored: Number(meter?.SCORED ?? 0),
+          anomalies_found: Number(meter?.FOUND ?? 0),
+          pct_flagged: Number(meter?.PCT_FLAGGED ?? 0),
+          avg_distance: Number(meter?.AVG_DISTANCE ?? 0),
+          max_distance: Number(meter?.MAX_DISTANCE ?? 0),
+        },
+        injected: {
+          theft_meters: 50, theft_window: '2025-08-15 18:00 — 21:45 UTC',
+          dead_meters: 30,  dead_window:  '2025-11-10 — 2025-11-12',
+          voltage_sag_meters: 20, voltage_sag_window: '2026-01-15 14:00 — 15:00 UTC',
+        }
+      };
+    });
+    res.json(data);
+  } catch (e) { console.error('model_card', e); res.status(500).json({ error: e.message }); }
+});
+
 // --- Healthcheck ---------------------------------------------------------
 app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
@@ -580,13 +680,36 @@ app.post('/api/intelligence/stream', express.json(), async (req, res) => {
           const name = data.name || '';
           if (name === 'ami_analyst')      send({ type: 'status', title: 'Cortex Analyst', content: 'Translating to SQL', icon: 'code' });
           else if (name === 'search_kb')   send({ type: 'status', title: 'Cortex Search', content: 'Searching knowledge base', icon: 'book' });
+          else if (name === 'to_chart')    send({ type: 'status', title: 'Building chart', content: 'Generating chart spec', icon: 'chart' });
           else if (data.type && data.type.includes('semantic_context')) send({ type: 'status', title: 'Loading semantic context', content: '', icon: 'db' });
           else                              send({ type: 'status', title: name || 'Tool use', content: '', icon: 'sparkles' });
         } else if (evtName === 'response.tool_result.status') {
           // ignore individual tool execution status (covered by status above)
         } else if (evtName === 'response.tool_result') {
-          // Examine content for SQL or search results
+          // Examine content for SQL or search results or chart spec
           const content = data.content || [];
+          // DEBUG: log to stderr so we can see what comes back
+          if (process.env.AGENT_DEBUG) {
+            try { console.error('[agent.tool_result]', JSON.stringify(data).slice(0, 2000)) } catch {}
+          }
+          // Detect any chart/vega payload anywhere in the content (defensive — provider
+          // returns it under various field names depending on version).
+          const findChartSpec = (obj, depth = 0) => {
+            if (!obj || depth > 6) return null
+            if (typeof obj !== 'object') return null
+            // Vega-Lite spec is recognisable by $schema or {mark, data, encoding}
+            if (obj.$schema && String(obj.$schema).includes('vega')) return obj
+            if (obj.mark && obj.encoding) return obj
+            if (obj.layer || obj.hconcat || obj.vconcat) return obj
+            if (Array.isArray(obj)) {
+              for (const v of obj) { const f = findChartSpec(v, depth+1); if (f) return f }
+              return null
+            }
+            for (const k of Object.keys(obj)) {
+              const f = findChartSpec(obj[k], depth+1); if (f) return f
+            }
+            return null
+          }
           for (const c of content) {
             if (c?.type === 'json' && c.json) {
               if (c.json.sql) {
@@ -599,6 +722,21 @@ app.post('/api/intelligence/stream', express.json(), async (req, res) => {
                   snippet: (sr.text || sr.content || '').slice(0, 240)
                 }));
                 send({ type: 'citations', citations });
+              }
+              // data_to_chart returns charts as array of JSON-encoded Vega-Lite strings
+              if (Array.isArray(c.json.charts) && c.json.charts.length) {
+                for (const cs of c.json.charts) {
+                  try {
+                    const spec = typeof cs === 'string' ? JSON.parse(cs) : cs
+                    send({ type: 'chart', spec })
+                  } catch (e) {
+                    console.error('chart parse error', e)
+                  }
+                }
+              } else {
+                // Fallback: scan for an embedded vega-lite spec object
+                const spec = findChartSpec(c.json)
+                if (spec) send({ type: 'chart', spec })
               }
             }
           }

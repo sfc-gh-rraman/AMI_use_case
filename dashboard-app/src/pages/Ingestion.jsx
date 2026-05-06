@@ -1,9 +1,13 @@
 import { useEffect, useState } from 'react'
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer,
   AreaChart, Area, CartesianGrid, Legend } from 'recharts'
-import { Database, Users, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Database, Users, CheckCircle2, AlertCircle, DollarSign } from 'lucide-react'
 import { api, fmt, TERR_COLOR } from '../components/api'
 import { KpiCard, Panel, Empty } from '../components/UI'
+
+// Synthetic placeholder rate until tariffs land (§15)
+const RATE_PER_KWH = 0.15
+const AVG_KWH_PER_INTERVAL = 2.0  // population-weighted from synthetic data
 
 export default function Ingestion() {
   const [kpi, setKpi] = useState({})
@@ -15,6 +19,10 @@ export default function Ingestion() {
     api('ingestion/sla').then(d => setSla(Array.isArray(d) ? d : []))
   }, [])
   const tooltipStyle = { background: '#0d1117', border: '1px solid #30363d', borderRadius: 6 }
+
+  // $ exposure from late arrivals = late_count * avg_kwh_per_interval * rate (delayed billing risk)
+  const dollarExposure = kpi.late_1d ? (kpi.late_1d * AVG_KWH_PER_INTERVAL * RATE_PER_KWH) : 0
+
   return (
     <div className="p-6 space-y-4">
       <div className="flex gap-3 flex-wrap">
@@ -22,6 +30,10 @@ export default function Ingestion() {
         <KpiCard icon={Users} label="Distinct meters" value={fmt(kpi.meters)} accent="text-atlas-blue"/>
         <KpiCard icon={CheckCircle2} label="On-time %" value={kpi.on_time !== undefined ? kpi.on_time + '%' : '—'} accent="text-atlas-green"/>
         <KpiCard icon={AlertCircle} label="Late arrivals (1d)" value={fmt(kpi.late_1d)} accent="text-atlas-yellow"/>
+        <KpiCard icon={DollarSign} label="$ exposure (1d, est.)"
+          value={'$' + dollarExposure.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+          sub={`@ $${RATE_PER_KWH}/kWh placeholder`}
+          accent="text-atlas-green"/>
       </div>
 
       <Panel title="Reads per hour by territory (last 48h)">

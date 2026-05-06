@@ -1,12 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
-import { Send, Sparkles, User, Loader2, Code, ChevronDown, ChevronUp, CheckCircle, Database, BookOpen } from 'lucide-react'
+import { Send, Sparkles, User, Loader2, Code, ChevronDown, ChevronUp, CheckCircle, Database, BookOpen, BarChart3 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import VegaChart from './VegaChart'
 
 const SUGGESTIONS = [
-  'What is the total kWh by territory in the last month?',
+  'Plot total kWh by territory in the last month',
+  'Show me a chart of billing readiness over time',
+  'Compare TOU bucket charges as a bar chart',
   'Which feeders have the worst data quality?',
   'How many billing periods are not ready to bill?',
-  'Show me total energy charges by TOU bucket.',
   'Explain the outage response runbook.',
   'Describe the SCE tariff hierarchy.',
 ]
@@ -33,7 +35,7 @@ export default function Chat() {
     setInput('')
     setBusy(true)
 
-    let answer = '', sql = '', rows = [], citations = [], steps = []
+    let answer = '', sql = '', rows = [], citations = [], steps = [], chart = null
     try {
       const r = await fetch('/api/intelligence/stream', {
         method: 'POST',
@@ -68,19 +70,22 @@ export default function Chat() {
             } else if (e.type === 'citations') {
               citations = e.citations || []
               if (citations.length) steps = [...steps, { id: 's'+steps.length, title: 'Knowledge search', content: `${citations.length} sources retrieved`, status: 'completed', icon: 'book' }]
+            } else if (e.type === 'chart') {
+              chart = e.spec
+              steps = [...steps, { id: 's'+steps.length, title: 'Chart generated', content: 'Vega-Lite spec produced', status: 'completed', icon: 'chart' }]
             } else if (e.type === 'text') {
               answer += e.content || ''
             } else if (e.type === 'error') {
               answer += '\n\n⚠️ ' + (e.content || 'Error')
             }
             setMessages(m => m.map(msg => msg.id === aId
-              ? { ...msg, content: answer, steps: [...steps], sql, rows, citations }
+              ? { ...msg, content: answer, steps: [...steps], sql, rows, citations, chart }
               : msg))
           } catch {}
         }
       }
       steps.forEach(s => s.status = 'completed')
-      setMessages(m => m.map(msg => msg.id === aId ? { ...msg, content: answer || 'Done.', steps, sql, rows, citations, streaming: false } : msg))
+      setMessages(m => m.map(msg => msg.id === aId ? { ...msg, content: answer || 'Done.', steps, sql, rows, citations, chart, streaming: false } : msg))
       setTimeout(() => setShowSteps(s => ({ ...s, [aId]: false })), 1500)
     } catch (err) {
       setMessages(m => m.map(msg => msg.id === aId
@@ -96,6 +101,7 @@ export default function Chat() {
     if (icon === 'code') return <Code size={14} className="text-atlas-purple flex-shrink-0 mt-0.5" />
     if (icon === 'db')   return <Database size={14} className="text-atlas-cyan flex-shrink-0 mt-0.5" />
     if (icon === 'book') return <BookOpen size={14} className="text-atlas-yellow flex-shrink-0 mt-0.5" />
+    if (icon === 'chart') return <BarChart3 size={14} className="text-atlas-green flex-shrink-0 mt-0.5" />
     return <Sparkles size={14} className="text-slate-500 flex-shrink-0 mt-0.5" />
   }
 
@@ -149,6 +155,16 @@ export default function Chat() {
                     </div>
                   : m.content}
               </div>
+
+              {m.role === 'assistant' && m.chart && (
+                <div className="mt-2 card p-3">
+                  <div className="text-[10px] text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+                    <BarChart3 size={11} className="text-atlas-green"/>
+                    Chart
+                  </div>
+                  <VegaChart spec={m.chart}/>
+                </div>
+              )}
 
               {m.role === 'assistant' && m.rows && m.rows.length > 0 && (
                 <div className="mt-2 card p-2 overflow-auto max-h-72">
