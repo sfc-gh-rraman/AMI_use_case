@@ -495,74 +495,143 @@ app.get('/api/observability/audit', async (_req, res) => {
 });
 
 // --- Snowflake Intelligence (Agent + Search) ------------------------------
-app.post('/api/intelligence/ask', express.json(), async (req, res) => {
-  try {
-    const question = (req.body && req.body.question) || '';
-    if (!question) return res.json({ answer: '', sql: '', rows: [], citations: [] });
+app.post('/api/intelligence/stream', express.json(), async (req, res) => {
+  const question = (req.body && req.body.question) || '';
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  const send = (obj) => res.write('data: ' + JSON.stringify(obj) + '\n\n');
 
+  if (!question) { send({ type: 'error', content: 'Empty question' }); send({ type: 'done' }); return res.end(); }
+
+  try {
     const inSpcs = fs.existsSync('/snowflake/session/token');
-    if (!inSpcs) {
-      return res.json({ answer: 'Cortex Agent requires SPCS OAuth token (not available locally).', sql: '', rows: [], citations: [] });
-    }
     const account = process.env.SNOWFLAKE_ACCOUNT;
-    const host    = process.env.SNOWFLAKE_HOST || (account + '.snowflakecomputing.com');
-    const token   = fs.readFileSync('/snowflake/session/token', 'utf8');
+    const host = process.env.SNOWFLAKE_HOST || (account + '.snowflakecomputing.com');
+
+    let token, tokenType;
+    if (inSpcs) {
+      token = fs.readFileSync('/snowflake/session/token', 'utf8');
+      tokenType = 'OAUTH';
+    } else if (process.env.SNOWFLAKE_PAT || process.env.SNOWFLAKE_PASSWORD) {
+      // PAT auth - use the password (which is a PAT in our connections.toml)
+      token = process.env.SNOWFLAKE_PAT || process.env.SNOWFLAKE_PASSWORD;
+      tokenType = 'PROGRAMMATIC_ACCESS_TOKEN';
+    } else {
+      send({ type: 'error', content: 'No Snowflake auth available.' });
+      send({ type: 'done' }); return res.end();
+    }
 
     const url = `https://${host}/api/v2/databases/AMI_DEMO/schemas/AMI_MART/agents/AMI_INTELLIGENCE_AGENT:run`;
-    const body = { messages: [{ role: 'user', content: [{ type: 'text', text: question }] }] };
+
+    send({ type: 'status', title: 'Routing question', content: 'Selecting Cortex Analyst vs Cortex Search', icon: 'sparkles' });
 
     const r = await fetch(url, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'X-Snowflake-Authorization-Token-Type': 'OAUTH'
+        'X-Snowflake-Authorization-Token-Type': tokenType,
+        'Accept': 'text/event-stream'
       },
-      body: JSON.stringify(body)
+      body: JSON.stringify({ messages: [{ role: 'user', content: [{ type: 'text', text: question }] }] })
     });
-    const txt = await r.text();
-    if (!r.ok) {
-      return res.json({ answer: 'Agent error: ' + txt.slice(0, 500), sql: '', rows: [], citations: [] });
+
+    if (!r.ok || !r.body) {
+      const txt = await r.text();
+      console.error('Agent error response:', r.status, txt.slice(0, 500));
+      send({ type: 'error', content: `Agent ${r.status}: ${txt.slice(0, 200)}` });
+      send({ type: 'done' }); return res.end();
     }
 
-    // The agent returns SSE-style streaming or JSON object; handle both.
-    let answer = '', sql = '', citations = [];
-    try {
-      // Try to parse SSE event lines
-      for (const line of txt.split('\n')) {
-        if (!line.startsWith('data:')) continue;
-        const json = line.slice(5).trim();
-        if (!json || json === '[DONE]') continue;
-        try {
-          const ev = JSON.parse(json);
-          const delta = ev?.delta?.content || ev?.content || [];
-          for (const c of (Array.isArray(delta) ? delta : [delta])) {
-            if (c?.type === 'text' && c.text) answer += c.text;
-            if (c?.type === 'tool_results' && c?.tool_results?.content) {
-              for (const tr of c.tool_results.content) {
-                if (tr?.type === 'json') {
-                  if (tr.json?.sql) sql = tr.json.sql;
-                  if (Array.isArray(tr.json?.searchResults)) {
-                    for (const sr of tr.json.searchResults) {
-                      citations.push({ title: sr.title || sr.doc_id, snippet: (sr.text || '').slice(0,200) });
-                    }
-                  }
-                }
+    let buffer = '';
+    let sql = '', citations = [];
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += dec.decode(value, { stream: true });
+      // Split by blank lines (SSE event boundary)
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || '';
+      for (const ev of events) {
+        const lines = ev.split(/\r?\n/);
+        let evtName = 'message';
+        let dataStr = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) evtName = line.slice(6).trim();
+          else if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!dataStr || dataStr === '[DONE]') continue;
+        let data;
+        try { data = JSON.parse(dataStr); } catch { continue; }
+
+        if (evtName === 'response.status') {
+          const msg = data.message || '';
+          if (data.status === 'planning')                 send({ type: 'status', title: 'Planning', content: msg, icon: 'sparkles' });
+          else if (data.status === 'extracting_tool_calls') send({ type: 'status', title: 'Choosing tool', content: msg, icon: 'sparkles' });
+          else if (data.status === 'executing_tools')      send({ type: 'status', title: 'Running tools', content: msg, icon: 'sparkles' });
+          else if (data.status === 'reasoning_agent_stop') send({ type: 'status', title: 'Reviewing', content: msg, icon: 'sparkles' });
+          else if (data.status === 'reevaluating_plan')    send({ type: 'status', title: 'Reevaluating', content: msg, icon: 'sparkles' });
+          else if (data.status === 'generating_response')  send({ type: 'status', title: 'Composing answer', content: msg, icon: 'sparkles' });
+        } else if (evtName === 'response.tool_use') {
+          const name = data.name || '';
+          if (name === 'ami_analyst')      send({ type: 'status', title: 'Cortex Analyst', content: 'Translating to SQL', icon: 'code' });
+          else if (name === 'search_kb')   send({ type: 'status', title: 'Cortex Search', content: 'Searching knowledge base', icon: 'book' });
+          else if (data.type && data.type.includes('semantic_context')) send({ type: 'status', title: 'Loading semantic context', content: '', icon: 'db' });
+          else                              send({ type: 'status', title: name || 'Tool use', content: '', icon: 'sparkles' });
+        } else if (evtName === 'response.tool_result.status') {
+          // ignore individual tool execution status (covered by status above)
+        } else if (evtName === 'response.tool_result') {
+          // Examine content for SQL or search results
+          const content = data.content || [];
+          for (const c of content) {
+            if (c?.type === 'json' && c.json) {
+              if (c.json.sql) {
+                sql = c.json.sql;
+                send({ type: 'sql', sql });
+              }
+              if (Array.isArray(c.json.searchResults)) {
+                citations = c.json.searchResults.map(sr => ({
+                  title: sr.title || sr.doc_id || 'KB',
+                  snippet: (sr.text || sr.content || '').slice(0, 240)
+                }));
+                send({ type: 'citations', citations });
               }
             }
           }
-        } catch (_e) { /* skip malformed line */ }
+        } else if (evtName === 'response.text.delta') {
+          if (data.text) send({ type: 'text', content: data.text });
+        } else if (evtName === 'response.text') {
+          // Final full text - skip to avoid duplicating deltas
+        } else if (evtName === 'response.thinking.delta') {
+          // Optional: surface as fine-grained thinking; skipping to keep UI clean
+        } else if (evtName === 'error') {
+          send({ type: 'error', content: data.message || 'Agent error' });
+        } else if (evtName === 'done') {
+          // handled at end
+        }
       }
-    } catch (_e) {/* fall through */}
-
-    let rows = [];
-    if (sql) {
-      try { rows = await runQuery(sql); } catch (_e) { rows = []; }
     }
-    res.json({ answer: answer.trim(), sql, rows: rows.slice(0, 25), citations });
+
+    if (sql && !citations.length) {
+      // SQL was generated by analyst - execute and return rows
+      try {
+        const rows = await runQuery(sql);
+        send({ type: 'rows', rows: (rows || []).slice(0, 25) });
+      } catch (e) {
+        send({ type: 'error', content: 'SQL execution error: ' + e.message });
+      }
+    }
+    send({ type: 'done' });
+    res.end();
   } catch (e) {
-    console.error('intelligence', e);
-    res.status(500).json({ error: e.message });
+    console.error('intelligence stream', e);
+    send({ type: 'error', content: e.message });
+    send({ type: 'done' });
+    res.end();
   }
 });
 
@@ -572,7 +641,6 @@ app.get('/api/intelligence/suggestions', (_req, res) => {
     'Which feeders have the worst data quality?',
     'How many billing periods are not ready to bill?',
     'Show me total energy charges by TOU bucket.',
-    'Which territories have the most anomalies?',
     'Explain the outage response runbook.',
     'What is the billing readiness criteria?',
     'Describe the SCE tariff hierarchy.',

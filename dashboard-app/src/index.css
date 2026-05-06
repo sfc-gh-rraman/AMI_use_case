@@ -1,0 +1,36 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; }
+body {
+  background-color: #0a0d14;
+  color: #f1f5f9;
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-track { background: #0d1117; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }
+
+@layer components {
+  .card {
+    @apply bg-navy-800/80 border border-navy-600/50 rounded-lg backdrop-blur-sm;
+  }
+  .card-hover {
+    @apply card hover:border-atlas-blue/30 hover:bg-navy-700/80 transition-all duration-200;
+  }
+  .pill {
+    @apply inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium;
+  }
+}
+
+.leaflet-container { background: #0a0d14; }
+.leaflet-popup-content-wrapper {
+  background: #0d1117 !important;
+  color: #f1f5f9 !important;
+  border: 1px solid #30363d;
+}
+.leaflet-popup-tip { background: #0d1117 !important; }
