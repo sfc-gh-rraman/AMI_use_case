@@ -684,6 +684,181 @@ app.get('/api/observability/audit', async (_req, res) => {
   } catch (e) { console.error('obs_audit', e); res.status(500).json({ error: e.message }); }
 });
 
+// --- Edge Cases ----------------------------------------------------------
+// Surfaces 4 well-known AMI ops issues directly from the data model.
+
+app.get('/api/edge/kpi', async (_req, res) => {
+  try {
+    const data = await cached('edge_kpi', 300, async () => {
+      const rows = await runQuery(`
+        WITH cur AS (SELECT MAX(READ_TS) AS m FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL),
+             daily_counts AS (
+               SELECT METER_ID, COUNT(*) AS N
+               FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL, cur
+               WHERE READ_TS >= cur.m - INTERVAL '1 day'
+                 AND CHANNEL_CODE = 'KWH_DEL'
+               GROUP BY 1
+             )
+        SELECT
+          (SELECT COUNT(*) FROM daily_counts WHERE N < 96)                            AS PARTIAL_METERS_24H,
+          (SELECT COUNT(*) FROM daily_counts WHERE N < 48)                            AS SEVERE_METERS_24H,
+          (SELECT COUNT(*) FROM AMI_DEMO.AMI_OBSERVABILITY.DT_DUPLICATE_AUDIT)         AS DUPLICATES_RESOLVED,
+          (SELECT COUNT(*) FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL
+              WHERE VEE_STATUS = 'ESTIMATED'
+                AND READ_TS >= (SELECT m FROM cur) - INTERVAL '7 days')                AS ESTIMATED_7D,
+          (SELECT COUNT(*) FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL
+              WHERE VEE_STATUS = 'FAILED'
+                AND READ_TS >= (SELECT m FROM cur) - INTERVAL '7 days')                AS FAILED_7D,
+          (SELECT COUNT(*) FROM AMI_DEMO.AMI_OBSERVABILITY.DT_METER_PREMISE_MISMATCH)  AS MAPPING_ISSUES`);
+      const r = rows[0] || {};
+      return {
+        partial_meters_24h:  Number(r.PARTIAL_METERS_24H  ?? 0),
+        severe_meters_24h:   Number(r.SEVERE_METERS_24H   ?? 0),
+        duplicates_resolved: Number(r.DUPLICATES_RESOLVED ?? 0),
+        estimated_7d:        Number(r.ESTIMATED_7D        ?? 0),
+        failed_7d:           Number(r.FAILED_7D           ?? 0),
+        mapping_issues:      Number(r.MAPPING_ISSUES      ?? 0),
+      };
+    });
+    res.json(data);
+  } catch (e) { console.error('edge_kpi', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/edge/missing-intervals', async (_req, res) => {
+  try {
+    const data = await cached('edge_missing', 300, async () => {
+      const histo = await runQuery(`
+        SELECT
+          CASE
+            WHEN INGESTION_LAG_SEC < 4*3600   THEN '0-4h'
+            WHEN INGESTION_LAG_SEC < 24*3600  THEN '4-24h'
+            WHEN INGESTION_LAG_SEC < 28*3600  THEN '24-28h'
+            ELSE '>28h'
+          END AS BUCKET,
+          COUNT(*) AS N
+        FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL TABLESAMPLE (1)
+        WHERE INGESTION_LAG_SEC IS NOT NULL
+        GROUP BY 1
+        ORDER BY 1`);
+      const top = await runQuery(`
+        WITH cur AS (SELECT MAX(READ_TS) AS m FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL),
+        per_meter AS (
+          SELECT METER_ID, COUNT(*) AS N
+          FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL i, cur
+          WHERE READ_TS >= cur.m - INTERVAL '1 day'
+            AND CHANNEL_CODE = 'KWH_DEL'
+          GROUP BY 1
+        )
+        SELECT p.METER_ID, m.UTILITY_TERRITORY, m.METER_TYPE, p.N AS INTERVALS_24H,
+               96 - p.N AS MISSING_24H
+        FROM per_meter p
+        JOIN AMI_DEMO.AMI_CURATED.METER m USING (METER_ID)
+        WHERE p.N < 96
+        ORDER BY p.N ASC, p.METER_ID
+        LIMIT 25`);
+      return {
+        histogram: histo.map(r => ({ bucket: r.BUCKET, n: Number(r.N) })),
+        top: top.map(r => ({
+          meter_id: r.METER_ID, territory: r.UTILITY_TERRITORY, meter_type: r.METER_TYPE,
+          intervals_24h: Number(r.INTERVALS_24H), missing_24h: Number(r.MISSING_24H),
+        })),
+      };
+    });
+    res.json(data);
+  } catch (e) { console.error('edge_missing', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/edge/duplicates', async (_req, res) => {
+  try {
+    const data = await cached('edge_dupes', 300, async () => {
+      const rows = await runQuery(`
+        SELECT DUPLICATE_ID, METER_ID, UTILITY_TERRITORY, READ_TS,
+               VALUE_FIRST, VALUE_SECOND,
+               TO_VARCHAR(RECEIVED_FIRST,  'MM-DD HH24:MI') AS RECEIVED_FIRST,
+               TO_VARCHAR(RECEIVED_SECOND, 'MM-DD HH24:MI') AS RECEIVED_SECOND,
+               TIMESTAMPDIFF(minute, RECEIVED_FIRST, RECEIVED_SECOND) AS GAP_MIN,
+               RESOLUTION
+        FROM AMI_DEMO.AMI_OBSERVABILITY.DT_DUPLICATE_AUDIT
+        ORDER BY READ_TS DESC LIMIT 25`);
+      const summary = await runQuery(`
+        SELECT COUNT(*) AS TOTAL,
+               AVG(TIMESTAMPDIFF(minute, RECEIVED_FIRST, RECEIVED_SECOND)) AS AVG_GAP_MIN,
+               AVG(ABS(VALUE_SECOND - VALUE_FIRST))                         AS AVG_DELTA
+        FROM AMI_DEMO.AMI_OBSERVABILITY.DT_DUPLICATE_AUDIT`);
+      const s = summary[0] || {};
+      return {
+        total:        Number(s.TOTAL ?? 0),
+        avg_gap_min:  Number(s.AVG_GAP_MIN ?? 0).toFixed(1),
+        avg_delta:    Number(s.AVG_DELTA ?? 0).toFixed(3),
+        sample: rows.map(r => ({
+          duplicate_id: Number(r.DUPLICATE_ID), meter_id: r.METER_ID, territory: r.UTILITY_TERRITORY,
+          read_ts: r.READ_TS, value_first: Number(r.VALUE_FIRST), value_second: Number(r.VALUE_SECOND),
+          received_first: r.RECEIVED_FIRST, received_second: r.RECEIVED_SECOND,
+          gap_min: Number(r.GAP_MIN), resolution: r.RESOLUTION,
+        })),
+      };
+    });
+    res.json(data);
+  } catch (e) { console.error('edge_dupes', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/edge/estimate-actual', async (_req, res) => {
+  try {
+    const data = await cached('edge_est', 300, async () => {
+      const dist = await runQuery(`
+        SELECT VEE_STATUS, COUNT(*) AS N
+        FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL TABLESAMPLE (1)
+        GROUP BY 1`);
+      const trend = await runQuery(`
+        SELECT TO_VARCHAR(DATE_TRUNC('day', READ_TS), 'MM-DD') AS D,
+               COUNT_IF(VEE_STATUS = 'VALID')     AS VALID,
+               COUNT_IF(VEE_STATUS = 'ESTIMATED') AS ESTIMATED,
+               COUNT_IF(VEE_STATUS = 'FAILED')    AS FAILED
+        FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL TABLESAMPLE (1)
+        WHERE READ_TS >= (SELECT MAX(READ_TS) FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL) - INTERVAL '14 days'
+        GROUP BY 1 ORDER BY 1`);
+      const methods = await runQuery(`
+        SELECT ESTIMATION_METHOD, COUNT(*) AS N
+        FROM AMI_DEMO.AMI_CURATED.INTERVAL_READ_CHANNEL TABLESAMPLE (1)
+        WHERE ESTIMATION_METHOD IS NOT NULL
+        GROUP BY 1 ORDER BY N DESC`);
+      return {
+        distribution: dist.map(r => ({ status: r.VEE_STATUS, n: Number(r.N) })),
+        trend:        trend.map(r => ({ d: r.D, valid: Number(r.VALID), estimated: Number(r.ESTIMATED), failed: Number(r.FAILED) })),
+        methods:      methods.map(r => ({ method: r.ESTIMATION_METHOD, n: Number(r.N) })),
+      };
+    });
+    res.json(data);
+  } catch (e) { console.error('edge_est', e); res.status(500).json({ error: e.message }); }
+});
+
+app.get('/api/edge/meter-premise', async (_req, res) => {
+  try {
+    const data = await cached('edge_premise', 600, async () => {
+      const rows = await runQuery(`
+        SELECT m.RANK, m.METER_ID, m.CURRENT_TYPE, m.SUGGESTED_TYPE,
+               m.AVG_EVE_KWH, m.AVG_DAY_KWH, m.AVG_NIGHT_KWH, m.AVG_OVERALL,
+               m.CONFIDENCE,
+               sp.UTILITY_TERRITORY, sp.FEEDER_ID
+        FROM AMI_DEMO.AMI_OBSERVABILITY.DT_METER_PREMISE_MISMATCH m
+        LEFT JOIN AMI_DEMO.AMI_CURATED.METER mt USING (METER_ID)
+        LEFT JOIN AMI_DEMO.AMI_CURATED.SERVICE_POINT sp USING (SERVICE_POINT_ID)
+        ORDER BY m.RANK
+        LIMIT 25`);
+      return rows.map(r => ({
+        rank: Number(r.RANK), meter_id: r.METER_ID,
+        current_type: r.CURRENT_TYPE, suggested_type: r.SUGGESTED_TYPE,
+        avg_eve: Number(r.AVG_EVE_KWH), avg_day: Number(r.AVG_DAY_KWH),
+        avg_night: Number(r.AVG_NIGHT_KWH), avg_overall: Number(r.AVG_OVERALL),
+        confidence: Number(r.CONFIDENCE),
+        territory: r.UTILITY_TERRITORY, feeder_id: r.FEEDER_ID,
+      }));
+    });
+    res.json(data);
+  } catch (e) { console.error('edge_premise', e); res.status(500).json({ error: e.message }); }
+});
+
+
 // --- Snowflake Intelligence (Agent + Search) ------------------------------
 app.post('/api/intelligence/stream', express.json(), async (req, res) => {
   const question = (req.body && req.body.question) || '';

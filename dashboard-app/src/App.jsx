@@ -12,6 +12,7 @@ import Anomaly from './pages/Anomaly'
 import Observability from './pages/Observability'
 import Intelligence from './pages/Intelligence'
 import Architecture from './pages/Architecture'
+import EdgeCases from './pages/EdgeCases'
 
 const PAGES = {
   home: Landing,
@@ -19,6 +20,7 @@ const PAGES = {
   transformers: Transformers, map: MapPage, events: Events,
   anomaly: Anomaly, observability: Observability, intelligence: Intelligence,
   architecture: Architecture,
+  edge: EdgeCases,
 }
 
 export default function App() {

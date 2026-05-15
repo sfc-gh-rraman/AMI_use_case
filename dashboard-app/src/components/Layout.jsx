@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import {
   Activity, Database, ShieldCheck, Receipt, Calculator, Cpu,
-  AlertTriangle, MapPin, Bell, Wrench, Sparkles, Home, Zap,
+  AlertTriangle, MapPin, Bell, Wrench, Sparkles, Home, Zap, ShieldAlert,
   ChevronLeft, ChevronRight
 } from 'lucide-react'
 
@@ -15,6 +15,7 @@ const NAV = [
   { id: 'map',           label: 'Map',           icon: MapPin },
   { id: 'events',        label: 'Events',        icon: Bell },
   { id: 'anomaly',       label: 'Anomalies',     icon: AlertTriangle },
+  { id: 'edge',          label: 'Edge Cases',    icon: ShieldAlert },
   { id: 'observability', label: 'Observability', icon: Wrench },
   { id: 'intelligence',  label: 'Intelligence',  icon: Sparkles },
   { id: 'architecture',  label: 'Architecture',  icon: Zap },
